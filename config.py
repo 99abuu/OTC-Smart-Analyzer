@@ -1,0 +1,8 @@
+
+import os
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+TIMEFRAMES = ["1m", "5m"]
+
+MIN_CONFIDENCE = 75
