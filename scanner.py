@@ -5,6 +5,7 @@ import threading
 import queue
 import time
 from datetime import datetime, timezone
+from statistics import mean
 
 from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
 from signal_engine import analyze_signal, is_new_signal
@@ -13,13 +14,15 @@ from signal_engine import analyze_signal, is_new_signal
 logger = logging.getLogger(__name__)
 
 MAX_SYMBOLS = 5
-TRADE_DURATION = 60
+MAX_CANDIDATES = 18
+MARKET_REFRESH_SECONDS = 300
 
+TRADE_DURATION = 60
 PRE_ENTRY_SECONDS = 60
 CONFIRM_BEFORE_ENTRY = 15
 MAX_ENTRY_DELAY = 10
 
-HISTORY_1M = 300
+HISTORY_1M = 80
 MIN_CANDLES_1M = 60
 MAX_CANDLES = 400
 
@@ -30,10 +33,274 @@ def format_time(timestamp):
     ).strftime("%H:%M:%S UTC")
 
 
+def parse_number(value, default=0):
+    try:
+        if isinstance(value, str):
+            value = value.replace("%", "").strip()
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def valid_market_candles(candles):
+    result = []
+
+    if not isinstance(candles, list):
+        return result
+
+    for candle in candles:
+        if not isinstance(candle, dict):
+            continue
+
+        try:
+            o = float(candle["open"])
+            h = float(candle["high"])
+            l = float(candle["low"])
+            c = float(candle["close"])
+
+            if min(o, h, l, c) <= 0:
+                continue
+
+            if h < max(o, c, l) or l > min(o, c, h):
+                continue
+
+            result.append({
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c
+            })
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return result
+
+
+def market_score(candles, payout):
+    candles = valid_market_candles(candles)
+
+    if len(candles) < MIN_CANDLES_1M:
+        return 0
+
+    recent = candles[-60:]
+
+    ranges = [
+        (c["high"] - c["low"]) / c["close"] * 100
+        for c in recent
+    ]
+
+    average_range = mean(ranges)
+
+    # نفضّل التذبذب المعتدل، وليس السوق شديد الهدوء أو العنيف.
+    volatility_score = max(
+        0,
+        100 - abs(average_range - 0.12) / 0.20 * 100
+    )
+
+    closes = [c["close"] for c in recent]
+
+    movements = [
+        abs(closes[i] - closes[i - 1])
+        for i in range(1, len(closes))
+    ]
+
+    total_movement = sum(movements)
+
+    if total_movement > 0:
+        consistency = (
+            abs(closes[-1] - closes[0]) / total_movement
+        ) * 100
+    else:
+        consistency = 0
+
+    # وضوح الحركة: هل توجد حركة اتجاهية أم حركة عشوائية؟
+    trend_score = min(100, consistency)
+
+    # تقييم تكرار الاقتراب من القمم والقيعان المحلية.
+    average_atr = mean([
+        c["high"] - c["low"] for c in recent
+    ])
+
+    tolerance = max(
+        average_atr * 0.30,
+        closes[-1] * 0.0001
+    )
+
+    pivot_highs = []
+    pivot_lows = []
+
+    for i in range(2, len(recent) - 2):
+        high = recent[i]["high"]
+        low = recent[i]["low"]
+
+        if all(
+            high >= recent[j]["high"]
+            for j in range(i - 2, i + 3) if j != i
+        ):
+            pivot_highs.append(high)
+
+        if all(
+            low <= recent[j]["low"]
+            for j in range(i - 2, i + 3) if j != i
+        ):
+            pivot_lows.append(low)
+
+    def count_level_groups(levels):
+        groups = []
+
+        for level in levels:
+            matched = False
+
+            for group in groups:
+                if abs(level - group[0]) <= tolerance:
+                    group.append(level)
+                    matched = True
+                    break
+
+            if not matched:
+                groups.append([level])
+
+        return sum(
+            1 for group in groups if len(group) >= 2
+        )
+
+    level_groups = (
+        count_level_groups(pivot_highs)
+        + count_level_groups(pivot_lows)
+    )
+
+    support_resistance_score = min(
+        100, level_groups * 20
+    )
+
+    data_score = min(
+        100, len(candles) / HISTORY_1M * 100
+    )
+
+    payout_score = max(0, min(100, payout))
+
+    final_score = (
+        volatility_score * 0.25
+        + consistency * 0.20
+        + support_resistance_score * 0.15
+        + data_score * 0.20
+        + trend_score * 0.10
+        + payout_score * 0.10
+    )
+
+    return round(final_score, 2)
+
+
+def rank_otc_markets(current_symbols=None):
+    current_symbols = current_symbols or []
+
+    symbols_data = fetch_otc_symbols()
+
+    if not symbols_data:
+        return [], {}
+
+    open_symbols = [
+        item for item in symbols_data
+        if isinstance(item, dict)
+        and item.get("isOtc") is True
+        and item.get("open") is True
+        and item.get("symbol")
+    ]
+
+    # استخدام الـPayout لتكوين قائمة مرشحة فقط.
+    # الترتيب النهائي يتم حسب التقييم المركب.
+    open_symbols.sort(
+        key=lambda item: parse_number(item.get("payout")),
+        reverse=True
+    )
+
+    candidates = []
+    seen = set()
+
+    # الاحتفاظ بالأسواق الحالية ضمن القائمة المرشحة
+    # لتقليل التغييرات غير الضرورية.
+    by_symbol = {
+        item["symbol"]: item for item in open_symbols
+    }
+
+    for symbol in current_symbols:
+        if symbol in by_symbol and symbol not in seen:
+            candidates.append(by_symbol[symbol])
+            seen.add(symbol)
+
+    for item in open_symbols:
+        symbol = item["symbol"]
+
+        if symbol in seen:
+            continue
+
+        candidates.append(item)
+        seen.add(symbol)
+
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+
+    ranked = []
+    histories = {}
+
+    for item in candidates:
+        symbol = item["symbol"]
+
+        try:
+            candles = fetch_candles(
+                symbol,
+                60,
+                HISTORY_1M
+            )
+
+            candles = valid_market_candles(candles)
+
+            if len(candles) < MIN_CANDLES_1M:
+                logger.info(
+                    "Market skipped: %s | insufficient candles",
+                    symbol
+                )
+                continue
+
+            payout = parse_number(item.get("payout"))
+
+            score = market_score(candles, payout)
+
+            if score <= 0:
+                continue
+
+            ranked.append({
+                "symbol": symbol,
+                "score": score,
+                "payout": payout
+            })
+
+            histories[symbol] = candles[-MAX_CANDLES:]
+
+        except Exception:
+            logger.exception(
+                "Market evaluation failed: %s",
+                symbol
+            )
+
+    ranked.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    selected = ranked[:MAX_SYMBOLS]
+
+    return selected, histories
+
+
 def stream_worker(symbols, tick_queue, stop_event):
     while not stop_event.is_set():
         try:
-            logger.info("Connecting to OTC live stream")
+            logger.info(
+                "Connecting to OTC live stream: %s",
+                symbols
+            )
 
             for event in stream_ticks(symbols):
                 if stop_event.is_set():
@@ -94,7 +361,9 @@ def validate_pending_signal(alert, price, candles_1m):
     ):
         return False, "الاستراتيجية لم تعد تؤكد الإشارة"
 
-    original_price = float(original.get("price", price))
+    original_price = parse_number(
+        original.get("price"), price
+    )
 
     if original_price <= 0:
         return False, "سعر الإشارة غير صالح"
@@ -110,59 +379,44 @@ def validate_pending_signal(alert, price, candles_1m):
 async def scanner_loop(send_signal, send_result):
     logger.info("OTC Smart Analyzer starting")
     logger.info("Analysis timeframe: 1m only")
-
-    symbols_data = await asyncio.to_thread(fetch_otc_symbols)
-
-    if not symbols_data:
-        logger.error("No OTC symbols received")
-        return
-
-    symbols_data = sorted(
-        symbols_data,
-        key=lambda item: float(item.get("payout") or 0),
-        reverse=True
+    logger.info("Dynamic market selection enabled")
+    logger.info(
+        "Market refresh interval: %s seconds",
+        MARKET_REFRESH_SECONDS
     )
 
-    symbols_data = [
-        item for item in symbols_data
-        if item.get("isOtc") is True
-        and item.get("open") is True
-    ][:MAX_SYMBOLS]
+    selected, initial_histories = await asyncio.to_thread(
+        rank_otc_markets,
+        []
+    )
 
-    symbols = [item["symbol"] for item in symbols_data]
-
-    if not symbols:
-        logger.error("No open OTC symbols found")
+    if not selected:
+        logger.error("No suitable OTC markets found")
         return
 
-    logger.info("Monitoring symbols: %s", symbols)
+    symbols = [item["symbol"] for item in selected]
 
-    candles_1m = {}
+    logger.info(
+        "Selected OTC markets: %s",
+        [
+            (item["symbol"], item["score"])
+            for item in selected
+        ]
+    )
+
+    candles_1m = {
+        symbol: initial_histories.get(symbol, [])
+        for symbol in symbols
+    }
+
     current_1m = {}
 
     for symbol in symbols:
-        try:
-            history = await asyncio.to_thread(
-                fetch_candles,
-                symbol,
-                60,
-                HISTORY_1M
-            )
-
-            candles_1m[symbol] = list(history)[-MAX_CANDLES:]
-
-            logger.info(
-                "History loaded: %s | 1m=%s",
-                symbol,
-                len(candles_1m[symbol])
-            )
-
-        except Exception:
-            logger.exception(
-                "History loading failed for %s",
-                symbol
-            )
-            candles_1m[symbol] = []
+        logger.info(
+            "History loaded: %s | 1m=%s",
+            symbol,
+            len(candles_1m[symbol])
+        )
 
     tick_queue = queue.Queue()
     stop_event = threading.Event()
@@ -177,6 +431,9 @@ async def scanner_loop(send_signal, send_result):
     pending_alerts = {}
     pending_trades = {}
     last_signal_time = {}
+
+    pending_selection = None
+    next_refresh = time.monotonic() + MARKET_REFRESH_SECONDS
 
     async def cancel_alert(symbol, alert, reason):
         message = dict(alert["signal"])
@@ -199,8 +456,139 @@ async def scanner_loop(send_signal, send_result):
 
         pending_alerts.pop(symbol, None)
 
+    async def apply_selection(new_selection, new_histories):
+        nonlocal symbols, tick_queue, stop_event, worker
+        nonlocal candles_1m, current_1m
+
+        new_symbols = [
+            item["symbol"] for item in new_selection
+        ]
+
+        if not new_symbols:
+            return False
+
+        if new_symbols == symbols:
+            logger.info(
+                "Market selection unchanged: %s",
+                symbols
+            )
+            return True
+
+        # لا نقطع أي تنبيه أو صفقة مفتوحة.
+        if pending_alerts or pending_trades:
+            return False
+
+        logger.info(
+            "Changing OTC markets: %s -> %s",
+            symbols,
+            new_symbols
+        )
+
+        stop_event.set()
+
+        await asyncio.to_thread(worker.join, 8)
+
+        if worker.is_alive():
+            logger.warning(
+                "Old stream has not stopped yet; "
+                "market rotation postponed"
+            )
+            return False
+
+        symbols = new_symbols
+
+        candles_1m = {
+            symbol: new_histories.get(symbol, [])
+            for symbol in symbols
+        }
+
+        current_1m = {}
+        tick_queue = queue.Queue()
+        stop_event = threading.Event()
+
+        worker = threading.Thread(
+            target=stream_worker,
+            args=(symbols, tick_queue, stop_event),
+            daemon=True
+        )
+
+        worker.start()
+
+        logger.info(
+            "New OTC markets active: %s",
+            [
+                (item["symbol"], item["score"])
+                for item in new_selection
+            ]
+        )
+
+        return True
+
     try:
         while True:
+            # تحديث تقييم الأسواق كل 5 دقائق.
+            if time.monotonic() >= next_refresh:
+                next_refresh = (
+                    time.monotonic() + MARKET_REFRESH_SECONDS
+                )
+
+                try:
+                    new_selection, new_histories = (
+                        await asyncio.to_thread(
+                            rank_otc_markets,
+                            symbols
+                        )
+                    )
+
+                    if new_selection:
+                        if pending_alerts or pending_trades:
+                            pending_selection = (
+                                new_selection,
+                                new_histories
+                            )
+
+                            logger.info(
+                                "Market rotation postponed: "
+                                "active alerts or trades"
+                            )
+                        else:
+                            applied = await apply_selection(
+                                new_selection,
+                                new_histories
+                            )
+
+                            if not applied:
+                                pending_selection = (
+                                    new_selection,
+                                    new_histories
+                                )
+
+                    else:
+                        logger.warning(
+                            "Market refresh returned no suitable markets"
+                        )
+
+                except Exception:
+                    logger.exception(
+                        "Dynamic market refresh failed"
+                    )
+
+            # تطبيق الاختيار المؤجل بعد انتهاء الصفقات والتنبيهات.
+            if (
+                pending_selection
+                and not pending_alerts
+                and not pending_trades
+            ):
+                new_selection, new_histories = pending_selection
+
+                applied = await apply_selection(
+                    new_selection,
+                    new_histories
+                )
+
+                if applied:
+                    pending_selection = None
+
             try:
                 tick = await asyncio.to_thread(
                     tick_queue.get,
@@ -216,8 +604,8 @@ async def scanner_loop(send_signal, send_result):
                 if symbol not in symbols:
                     continue
 
-                price = float(tick.get("price") or 0)
-                timestamp = float(tick.get("time") or 0)
+                price = parse_number(tick.get("price"))
+                timestamp = parse_number(tick.get("time"))
 
                 if price <= 0 or timestamp <= 0:
                     continue
@@ -227,7 +615,7 @@ async def scanner_loop(send_signal, send_result):
 
                 minute_bucket = int(timestamp // 60) * 60
 
-                # تسوية الصفقات التجريبية
+                # تسوية الصفقات التجريبية.
                 trade = pending_trades.get(symbol)
 
                 if trade and timestamp >= trade["settles_at"]:
@@ -276,7 +664,7 @@ async def scanner_loop(send_signal, send_result):
 
                     pending_trades.pop(symbol, None)
 
-                # بناء شموع الدقيقة
+                # بناء شموع الدقيقة.
                 candle = current_1m.get(symbol)
 
                 if candle is None:
@@ -317,7 +705,7 @@ async def scanner_loop(send_signal, send_result):
                 else:
                     continue
 
-                # إعادة التحقق من الإشارة قبل الدخول
+                # إعادة التحقق من الإشارة قبل الدخول.
                 alert = pending_alerts.get(symbol)
 
                 if alert:
@@ -431,7 +819,7 @@ async def scanner_loop(send_signal, send_result):
                         pending_alerts.pop(symbol, None)
                         continue
 
-                # لا نفتح تنبيهاً جديداً أثناء وجود صفقة أو تنبيه
+                # لا نفتح تنبيهاً جديداً أثناء وجود صفقة أو تنبيه.
                 if symbol in pending_trades:
                     continue
 
@@ -494,10 +882,9 @@ async def scanner_loop(send_signal, send_result):
                     delivered = False
 
                 if not delivered:
-                    pending_alerts.pop(symbol, None)
-
                     logger.warning(
-                        "PRE-ALERT NOT DELIVERED; SIGNAL DISCARDED: %s",
+                        "PRE-ALERT NOT DELIVERED; "
+                        "SIGNAL DISCARDED: %s",
                         symbol
                     )
                     continue
@@ -518,4 +905,5 @@ async def scanner_loop(send_signal, send_result):
 
     finally:
         stop_event.set()
+        await asyncio.to_thread(worker.join, 5)
         logger.info("OTC scanner stopped")
