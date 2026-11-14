@@ -3,12 +3,10 @@ import asyncio
 import logging
 import threading
 import queue
-import time
 from datetime import datetime, timezone
 
 from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
 from signal_engine import analyze_signal, is_new_signal
-
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +27,14 @@ def stream_worker(symbols, tick_queue, stop_event):
         try:
             logger.info("Connecting to OTC live stream")
 
+            received = False
+
             for tick in stream_ticks(symbols):
                 if stop_event.is_set():
                     break
 
                 if tick.get("_event") == "tick":
+                    received = True
                     try:
                         tick_queue.put(tick, timeout=2)
                     except queue.Full:
@@ -42,10 +43,14 @@ def stream_worker(symbols, tick_queue, stop_event):
                 elif tick.get("_event") in ("closed", "dropped"):
                     logger.warning("Stream event: %s", tick)
 
+            if not received:
+                logger.warning("Stream ended without receiving ticks")
+
         except Exception:
             logger.exception("Live stream disconnected")
 
         if not stop_event.is_set():
+            logger.info("Reconnecting to live stream in 5 seconds")
             stop_event.wait(5)
 
 
@@ -78,19 +83,21 @@ async def scanner_loop(send_signal, send_result):
     candles_1m = {}
     candles_5m = {}
 
-    # تحميل التاريخ مرة واحدة عند التشغيل
     for symbol in symbols:
         history_1m, history_5m = await asyncio.gather(
-            asyncio.to_thread(
-                fetch_candles, symbol, 60, 50
-            ),
-            asyncio.to_thread(
-                fetch_candles, symbol, 300, 50
-            )
+            asyncio.to_thread(fetch_candles, symbol, 60, 50),
+            asyncio.to_thread(fetch_candles, symbol, 300, 50)
         )
 
         candles_1m[symbol] = list(history_1m)
         candles_5m[symbol] = list(history_5m)
+
+        logger.info(
+            "History loaded: %s | 1m=%s | 5m=%s",
+            symbol,
+            len(history_1m),
+            len(history_5m)
+        )
 
     tick_queue = queue.Queue(maxsize=5000)
     stop_event = threading.Event()
@@ -100,12 +107,12 @@ async def scanner_loop(send_signal, send_result):
         args=(symbols, tick_queue, stop_event),
         daemon=True
     )
-
     worker.start()
 
     current_1m = {}
     building_5m = {}
     pending_trades = {}
+    seen_tick_symbols = set()
 
     async def process_tick(tick):
         symbol = tick.get("symbol")
@@ -122,9 +129,17 @@ async def scanner_loop(send_signal, send_result):
         price = float(price)
         timestamp = float(timestamp)
 
+        if symbol not in seen_tick_symbols:
+            seen_tick_symbols.add(symbol)
+            logger.info(
+                "LIVE PRICE RECEIVED: %s = %s at %s",
+                symbol,
+                price,
+                format_time(timestamp)
+            )
+
         minute_bucket = int(timestamp // 60)
 
-        # متابعة نتيجة الصفقة المفتوحة
         trade = pending_trades.get(symbol)
 
         if trade and timestamp >= trade["settles_at"]:
@@ -154,11 +169,16 @@ async def scanner_loop(send_signal, send_result):
 
             del pending_trades[symbol]
 
+            logger.info(
+                "PAPER RESULT: %s %s",
+                symbol,
+                result
+            )
+
             await send_result(result_data)
 
         previous = current_1m.get(symbol)
 
-        # أول تحديث لهذا الرمز
         if previous is None:
             current_1m[symbol] = {
                 "bucket": minute_bucket,
@@ -169,18 +189,15 @@ async def scanner_loop(send_signal, send_result):
             }
             return
 
-        # تحديث شمعة الدقيقة الحالية
         if minute_bucket == previous["bucket"]:
             previous["high"] = max(previous["high"], price)
             previous["low"] = min(previous["low"], price)
             previous["close"] = price
             return
 
-        # تجاهل التحديثات القديمة
         if minute_bucket < previous["bucket"]:
             return
 
-        # إغلاق الشمعة السابقة فقط إذا لم توجد فجوة
         if minute_bucket == previous["bucket"] + 1:
             closed_candle = {
                 "open": previous["open"],
@@ -189,12 +206,8 @@ async def scanner_loop(send_signal, send_result):
                 "close": previous["close"]
             }
 
-            add_candle(
-                candles_1m[symbol],
-                closed_candle
-            )
+            add_candle(candles_1m[symbol], closed_candle)
 
-            # بناء شموع 5 دقائق من شموع الدقيقة المغلقة
             five_bucket = previous["bucket"] // 5
             builder = building_5m.get(symbol)
 
@@ -210,12 +223,10 @@ async def scanner_loop(send_signal, send_result):
 
             elif five_bucket == builder["bucket"]:
                 builder["high"] = max(
-                    builder["high"],
-                    closed_candle["high"]
+                    builder["high"], closed_candle["high"]
                 )
                 builder["low"] = min(
-                    builder["low"],
-                    closed_candle["low"]
+                    builder["low"], closed_candle["low"]
                 )
                 builder["close"] = closed_candle["close"]
                 builder["count"] += 1
@@ -235,6 +246,11 @@ async def scanner_loop(send_signal, send_result):
                         }
                     )
 
+                    logger.info(
+                        "5m candle completed: %s",
+                        symbol
+                    )
+
                 building_5m[symbol] = {
                     "bucket": five_bucket,
                     "open": closed_candle["open"],
@@ -244,7 +260,6 @@ async def scanner_loop(send_signal, send_result):
                     "count": 1
                 }
 
-            # لا نفتح صفقة جديدة إذا كانت هناك صفقة معلقة
             if (
                 symbol not in pending_trades
                 and len(candles_1m[symbol]) >= 25
@@ -282,13 +297,11 @@ async def scanner_loop(send_signal, send_result):
 
         else:
             logger.warning(
-                "Missing minute data for %s; resetting candle builder",
+                "Missing minute data for %s; resetting 5m builder",
                 symbol
             )
-
             building_5m.pop(symbol, None)
 
-        # بدء شمعة الدقيقة الجديدة
         current_1m[symbol] = {
             "bucket": minute_bucket,
             "open": price,
@@ -305,7 +318,6 @@ async def scanner_loop(send_signal, send_result):
                     True,
                     1
                 )
-
                 await process_tick(tick)
 
             except queue.Empty:
