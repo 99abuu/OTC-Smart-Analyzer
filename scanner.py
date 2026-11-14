@@ -8,8 +8,8 @@ from signal_engine import analyze_signal, is_new_signal
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 5
-SCAN_INTERVAL = 60
+MAX_SYMBOLS = 5
+SCAN_INTERVAL = 180
 
 
 def scan_symbol(symbol):
@@ -37,35 +37,43 @@ def scan_symbol(symbol):
 async def scan_all_symbols():
     symbols = await asyncio.to_thread(fetch_otc_symbols)
 
-    if not symbols:
+    # اختيار أعلى خمس أدوات من حيث Payout
+    symbols.sort(
+        key=lambda item: float(item.get("payout") or 0),
+        reverse=True
+    )
+
+    selected = symbols[:MAX_SYMBOLS]
+
+    if not selected:
         logger.warning("No OTC symbols available")
         return []
 
+    logger.info(
+        "Monitoring symbols: %s",
+        [item["symbol"] for item in selected]
+    )
+
     results = []
 
-    for start in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[start:start + BATCH_SIZE]
+    for item in selected:
+        symbol = item["symbol"]
 
-        for item in batch:
-            symbol = item["symbol"]
+        try:
+            signal = await asyncio.to_thread(
+                scan_symbol,
+                symbol
+            )
 
-            try:
-                signal = await asyncio.to_thread(
-                    scan_symbol,
-                    symbol
-                )
+            if signal:
+                results.append(signal)
 
-                if signal:
-                    results.append(signal)
-
-            except Exception as error:
-                logger.error(
-                    "Analysis failed for %s: %s",
-                    symbol,
-                    error
-                )
-
-        await asyncio.sleep(2)
+        except Exception as error:
+            logger.error(
+                "Analysis failed for %s: %s",
+                symbol,
+                error
+            )
 
     return results
 
@@ -81,6 +89,9 @@ async def scanner_loop(send_signal):
                 await send_signal(signal)
 
         except Exception as error:
-            logger.exception("Scanner cycle failed: %s", error)
+            logger.exception(
+                "Scanner cycle failed: %s",
+                error
+            )
 
         await asyncio.sleep(SCAN_INTERVAL)
