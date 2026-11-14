@@ -20,9 +20,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# إخفاء سجلات طلبات HTTP التي قد تكشف رمز البوت
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 
@@ -30,22 +28,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     subscribers = context.application.bot_data.setdefault(
-        "subscribers", []
+        "subscribers", set()
     )
 
-    if chat_id not in subscribers:
-        subscribers.append(chat_id)
+    subscribers.add(chat_id)
 
     await update.message.reply_text(
         "🤖 OTC Smart Analyzer\n\n"
         "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
-        "🔍 مراقبة 5 أدوات OTC\n"
-        "⏱️ دورة الفحص كل 3 دقائق\n"
+        "🔍 مراقبة أفضل 5 أدوات OTC\n"
+        "⏱️ تنبيه قبل الدخول بـ60 ثانية\n"
         "📊 متابعة نتائج الصفقات مفعّلة\n\n"
         "/status - حالة البوت\n"
         "/analyze - تحليل يدوي\n"
         "/testsymbols - قائمة الأدوات\n\n"
-        "⚠️ النتائج تجريبية وليست ضماناً للربح."
+        "⚠️ جميع النتائج تجريبية وليست ضماناً للربح."
     )
 
 
@@ -53,12 +50,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = context.application.bot_data.get("scanner_task")
     running = task is not None and not task.done()
 
+    subscribers = context.application.bot_data.get(
+        "subscribers", set()
+    )
+
     await update.message.reply_text(
         "📊 حالة OTC Smart Analyzer\n\n"
         f"الماسح: {'🟢 يعمل' if running else '🔴 متوقف'}\n"
         "الأدوات المستهدفة: 5\n"
-        "الفاصل المستهدف: 3 دقائق\n"
-        "متابعة النتائج: مفعّلة\n\n"
+        "التنبيه المسبق: 60 ثانية\n"
+        f"المشتركون الحاليون: {len(subscribers)}\n\n"
         "⚠️ النتائج تجريبية فقط."
     )
 
@@ -90,12 +91,9 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         selected = item["symbol"]
 
-        candles_1m = await asyncio.to_thread(
-            fetch_candles, selected, 60, 50
-        )
-
-        candles_5m = await asyncio.to_thread(
-            fetch_candles, selected, 300, 50
+        candles_1m, candles_5m = await asyncio.gather(
+            asyncio.to_thread(fetch_candles, selected, 60, 50),
+            asyncio.to_thread(fetch_candles, selected, 300, 50)
         )
 
         signal = analyze_signal(candles_1m, candles_5m)
@@ -108,13 +106,12 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            "📡 نتيجة تحليل يدوي تجريبية\n\n"
+            "📡 تحليل يدوي تجريبي\n\n"
             f"الأداة: {selected}\n"
             f"الاتجاه: {signal['direction']}\n"
             f"النمط: {signal['pattern']}\n"
-            f"السعر المرجعي: {signal['entry_reference_price']}\n"
-            "الانتهاء المقترح: دقيقة واحدة\n\n"
-            "⚠️ هذا التحليل لا يتضمن توقيت دخول مباشر."
+            f"السعر المرجعي: {signal['entry_reference_price']}\n\n"
+            "⚠️ هذا التحليل ليس إشارة دخول مباشرة."
         )
 
     except Exception as error:
@@ -142,37 +139,89 @@ async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as error:
+        logger.exception("Symbol list failed")
         await update.message.reply_text(
             f"❌ خطأ: {str(error)[:300]}"
         )
 
 
-async def post_init(app):
-    async def notify(signal):
-        message = (
-            "🚨 فرصة OTC تجريبية\n\n"
-            f"الأداة: {signal['symbol']}\n"
-            f"الاتجاه: {signal['direction']}\n"
-            f"النمط: {signal['pattern']}\n"
-            f"وقت الإشارة: {signal['entry_time']}\n"
-            "المنطقة الزمنية: UTC\n"
-            f"سعر الدخول المرجعي: {signal['entry_price']}\n"
-            "مدة الصفقة: دقيقة واحدة\n\n"
-            "⚠️ السعر المرجعي مأخوذ من بث OTCharts، "
-            "وقد يختلف عن سعر دخولك الفعلي."
-        )
+async def send_to_subscribers(app, message):
+    subscribers = list(
+        app.bot_data.get("subscribers", set())
+    )
 
-        for chat_id in list(app.bot_data.get("subscribers", [])):
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=message
-                )
-            except Exception:
-                logger.exception(
-                    "Could not send signal to chat %s",
-                    chat_id
-                )
+    if not subscribers:
+        logger.warning("No Telegram subscribers available")
+        return False
+
+    success_count = 0
+
+    for chat_id in subscribers:
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=message
+            )
+            success_count += 1
+
+        except Exception:
+            logger.exception(
+                "Telegram delivery failed for chat %s",
+                chat_id
+            )
+
+    return success_count == len(subscribers)
+
+
+async def post_init(app):
+    app.bot_data["subscribers"] = set()
+
+    async def notify(signal):
+        phase = signal.get("phase")
+
+        if phase == "PRE_ALERT":
+            message = (
+                "🔔 تنبيه فرصة OTC قادمة\n\n"
+                f"الأداة: {signal['symbol']}\n"
+                f"الاتجاه المتوقع: {signal['direction']}\n"
+                f"النمط: {signal['pattern']}\n"
+                f"وقت التنبيه: {signal['alert_time']}\n"
+                f"موعد الدخول المقترح: "
+                f"{signal['planned_entry_time']}\n\n"
+                "⏳ الدخول المقترح بعد 60 ثانية.\n"
+                "سيعيد البوت فحص الشروط قبل تأكيد الدخول.\n"
+                "لا تدخل اعتماداً على هذا التنبيه وحده."
+            )
+
+        elif phase == "ENTRY":
+            message = (
+                "🚨 تأكيد دخول تجريبي\n\n"
+                f"الأداة: {signal['symbol']}\n"
+                f"الاتجاه: {signal['direction']}\n"
+                f"النمط: {signal['pattern']}\n"
+                f"وقت الدخول الافتراضي: {signal['entry_time']}\n"
+                f"السعر المرجعي: {signal['entry_price']}\n"
+                "مدة الصفقة التجريبية: دقيقة واحدة\n\n"
+                "⚠️ هذه صفقة افتراضية وليست أمراً "
+                "للتداول الحقيقي."
+            )
+
+        elif phase == "CANCELLED":
+            message = (
+                "❌ تم إلغاء فرصة OTC\n\n"
+                f"الأداة: {signal['symbol']}\n"
+                f"الاتجاه السابق: {signal['direction']}\n"
+                f"موعد الدخول الذي كان مقترحاً: "
+                f"{signal['planned_entry_time']}\n"
+                f"السبب: {signal['cancel_reason']}\n\n"
+                "لم يتم تسجيل صفقة لهذه الفرصة."
+            )
+
+        else:
+            logger.error("Unknown signal phase: %s", phase)
+            return False
+
+        return await send_to_subscribers(app, message)
 
     async def notify_result(result):
         labels = {
@@ -190,29 +239,17 @@ async def post_init(app):
             f"سعر النهاية: {result['exit_price']}\n"
             f"وقت البداية: {result['entry_time']}\n"
             f"وقت النهاية: {result['exit_time']}\n\n"
-            "⚠️ النتيجة محسوبة من أسعار OTCharts "
+            "⚠️ النتيجة محسوبة من أسعار OTCharts، "
             "وليست نتيجة تسوية Pocket Option الفعلية."
         )
 
-        for chat_id in list(app.bot_data.get("subscribers", [])):
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=message
-                )
-            except Exception:
-                logger.exception(
-                    "Could not send result to chat %s",
-                    chat_id
-                )
-
-    app.bot_data["subscribers"] = []
+        return await send_to_subscribers(app, message)
 
     app.bot_data["scanner_task"] = asyncio.create_task(
         scanner_loop(notify, notify_result)
     )
 
-    logger.info("Automatic scanner and result tracking started")
+    logger.info("Automatic scanner started")
 
 
 async def post_shutdown(app):
