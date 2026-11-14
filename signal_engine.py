@@ -1,11 +1,14 @@
 
 import logging
+import time
 from math import isfinite
 
 logger = logging.getLogger(__name__)
 
 MIN_CANDLES = 60
 SIGNAL_COOLDOWN_SECONDS = 3000
+
+_sent = {}
 
 
 def valid_candles(candles):
@@ -66,16 +69,28 @@ def rsi(values, period=14):
 
     changes = [
         values[i] - values[i - 1]
-        for i in range(len(values) - period, len(values))
+        for i in range(1, len(values))
     ]
 
-    gains = sum(max(change, 0) for change in changes) / period
-    losses = sum(max(-change, 0) for change in changes) / period
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
 
-    if losses == 0:
-        return 100 if gains > 0 else 50
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    rs = gains / losses
+    for i in range(period, len(gains)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100 if avg_gain > 0 else 50
+
+    rs = avg_gain / avg_loss
 
     return 100 - (100 / (1 + rs))
 
@@ -136,12 +151,25 @@ def get_trend(candles):
     if ema20 is None or ema50 is None:
         return "UNKNOWN", ema20, ema50, ema200
 
+    price = closes[-1]
+
     if ema200 is not None:
-        if ema50 > ema200 and ema20 > ema50:
+
+        if (
+            price > ema200
+            and ema50 > ema200
+            and ema20 > ema50
+        ):
             return "UP", ema20, ema50, ema200
 
-        if ema50 < ema200 and ema20 < ema50:
+        if (
+            price < ema200
+            and ema50 < ema200
+            and ema20 < ema50
+        ):
             return "DOWN", ema20, ema50, ema200
+
+        return "SIDEWAYS", ema20, ema50, ema200
 
     if ema20 > ema50:
         return "UP", ema20, ema50, ema200
@@ -152,14 +180,56 @@ def get_trend(candles):
     return "SIDEWAYS", ema20, ema50, ema200
 
 
-def find_support_resistance(candles, lookback=30):
+def find_support_resistance(candles, lookback=40):
     history = candles[-(lookback + 1):-1]
 
     if len(history) < 15:
         return None, None
 
-    support = min(c["low"] for c in history)
-    resistance = max(c["high"] for c in history)
+    price = candles[-1]["close"]
+
+    pivot_lows = []
+    pivot_highs = []
+
+    for i in range(1, len(history) - 1):
+
+        previous = history[i - 1]
+        current = history[i]
+        following = history[i + 1]
+
+        if (
+            current["low"] <= previous["low"]
+            and current["low"] < following["low"]
+        ):
+            pivot_lows.append(current["low"])
+
+        if (
+            current["high"] >= previous["high"]
+            and current["high"] > following["high"]
+        ):
+            pivot_highs.append(current["high"])
+
+    supports = [
+        level for level in pivot_lows
+        if level <= price
+    ]
+
+    resistances = [
+        level for level in pivot_highs
+        if level >= price
+    ]
+
+    support = (
+        max(supports)
+        if supports
+        else min(c["low"] for c in history)
+    )
+
+    resistance = (
+        min(resistances)
+        if resistances
+        else max(c["high"] for c in history)
+    )
 
     return support, resistance
 
@@ -179,23 +249,26 @@ def strategy_support_rejection(
     if not metrics:
         return None
 
-    distance = abs(candle["low"] - support)
+    tolerance = average_atr * 0.30
 
-    near_level = distance <= max(
-        average_atr * 0.25,
-        candle["close"] * 0.0005
+    touched_level = (
+        candle["low"] <= support + tolerance
+        and candle["low"] >= support - average_atr * 0.45
     )
 
     bullish_rejection = (
         candle["close"] > candle["open"]
+        and candle["close"] > support
         and metrics["lower_wick"] >= metrics["body"] * 1.2
-        and metrics["close_position"] >= 0.65
+        and metrics["lower_wick"] >= metrics["range"] * 0.25
+        and metrics["close_position"] >= 0.68
+        and metrics["body_ratio"] >= 0.15
     )
 
-    if near_level and bullish_rejection:
+    if touched_level and bullish_rejection:
         return (
             "CALL",
-            "Support Rejection: ارتداد من الدعم"
+            "Support Rejection: ارتداد مؤكد من منطقة الدعم"
         )
 
     return None
@@ -216,29 +289,32 @@ def strategy_resistance_rejection(
     if not metrics:
         return None
 
-    distance = abs(candle["high"] - resistance)
+    tolerance = average_atr * 0.30
 
-    near_level = distance <= max(
-        average_atr * 0.25,
-        candle["close"] * 0.0005
+    touched_level = (
+        candle["high"] >= resistance - tolerance
+        and candle["high"] <= resistance + average_atr * 0.45
     )
 
     bearish_rejection = (
         candle["close"] < candle["open"]
+        and candle["close"] < resistance
         and metrics["upper_wick"] >= metrics["body"] * 1.2
-        and metrics["close_position"] <= 0.35
+        and metrics["upper_wick"] >= metrics["range"] * 0.25
+        and metrics["close_position"] <= 0.32
+        and metrics["body_ratio"] >= 0.15
     )
 
-    if near_level and bearish_rejection:
+    if touched_level and bearish_rejection:
         return (
             "PUT",
-            "Resistance Rejection: رفض سعري عند المقاومة"
+            "Resistance Rejection: رفض مؤكد من منطقة المقاومة"
         )
 
     return None
 
 
-def strategy_trend_pullback(candles, trend):
+def strategy_trend_pullback(candles, trend, average_atr=None):
     if trend not in ("UP", "DOWN"):
         return None
 
@@ -251,7 +327,12 @@ def strategy_trend_pullback(candles, trend):
     ema50 = ema(closes, 50)
     current_rsi = rsi(closes)
 
-    if ema20 is None or ema50 is None or current_rsi is None:
+    if (
+        ema20 is None
+        or ema50 is None
+        or current_rsi is None
+        or average_atr is None
+    ):
         return None
 
     metrics = candle_metrics(current)
@@ -262,8 +343,8 @@ def strategy_trend_pullback(candles, trend):
     if trend == "UP":
 
         pullback = (
-            previous["low"] <= ema20 * 1.0015
-            or previous["low"] <= ema50 * 1.0015
+            previous["low"] <= ema20 + average_atr * 0.25
+            and previous["low"] >= ema50 - average_atr * 0.80
         )
 
         recovery = (
@@ -276,14 +357,14 @@ def strategy_trend_pullback(candles, trend):
         if pullback and recovery:
             return (
                 "CALL",
-                "Trend Pullback: تصحيح ثم استئناف الاتجاه الصاعد"
+                "Trend Pullback: تصحيح مؤكد واستئناف الاتجاه الصاعد"
             )
 
     if trend == "DOWN":
 
         pullback = (
-            previous["high"] >= ema20 * 0.9985
-            or previous["high"] >= ema50 * 0.9985
+            previous["high"] >= ema20 - average_atr * 0.25
+            and previous["high"] <= ema50 + average_atr * 0.80
         )
 
         recovery = (
@@ -296,7 +377,7 @@ def strategy_trend_pullback(candles, trend):
         if pullback and recovery:
             return (
                 "PUT",
-                "Trend Pullback: تصحيح ثم استئناف الاتجاه الهابط"
+                "Trend Pullback: تصحيح مؤكد واستئناف الاتجاه الهابط"
             )
 
     return None
@@ -317,18 +398,23 @@ def strategy_breakout_retest(candles, average_atr):
     resistance = max(c["high"] for c in reference)
     support = min(c["low"] for c in reference)
 
-    tolerance = average_atr * 0.25
+    tolerance = average_atr * 0.30
+    breakout_buffer = average_atr * 0.05
 
     bullish_retest = (
-        previous["close"] > resistance
+        previous["close"] > resistance + breakout_buffer
+        and previous["close"] > previous["open"]
         and current["low"] <= resistance + tolerance
+        and current["low"] >= resistance - average_atr * 0.45
         and current["close"] > resistance
         and current["close"] > current["open"]
     )
 
     bearish_retest = (
-        previous["close"] < support
+        previous["close"] < support - breakout_buffer
+        and previous["close"] < previous["open"]
         and current["high"] >= support - tolerance
+        and current["high"] <= support + average_atr * 0.45
         and current["close"] < support
         and current["close"] < current["open"]
     )
@@ -336,22 +422,80 @@ def strategy_breakout_retest(candles, average_atr):
     if bullish_retest:
         return (
             "CALL",
-            "Breakout Retest: اختراق المقاومة وإعادة اختبارها"
+            "Breakout Retest: اختراق مؤكد وإعادة اختبار المقاومة"
         )
 
     if bearish_retest:
         return (
             "PUT",
-            "Breakout Retest: كسر الدعم وإعادة اختباره"
+            "Breakout Retest: كسر مؤكد وإعادة اختبار الدعم"
         )
 
     return None
 
 
+def calculate_signal_score(
+    selected,
+    direction,
+    trend,
+    ema200,
+    price,
+    current_rsi,
+    metrics
+):
+    score = 45
+
+    # عدد الاستراتيجيات المتوافقة
+    score += min(16, (len(selected) - 1) * 8)
+
+    # قوة جسم شمعة الإشارة
+    score += min(12, metrics["body_ratio"] * 12)
+
+    # موقع الإغلاق داخل الشمعة
+    if direction == "CALL":
+        score += metrics["close_position"] * 10
+
+    else:
+        score += (1 - metrics["close_position"]) * 10
+
+    # توافق الاتجاه العام
+    if (
+        (direction == "CALL" and trend == "UP")
+        or (direction == "PUT" and trend == "DOWN")
+    ):
+        score += 8
+
+    # توافق السعر مع EMA200
+    if ema200 is not None:
+
+        if (
+            direction == "CALL"
+            and price > ema200
+        ):
+            score += 5
+
+        elif (
+            direction == "PUT"
+            and price < ema200
+        ):
+            score += 5
+
+    # RSI غير متطرف
+    if current_rsi is not None:
+
+        if direction == "CALL" and 45 <= current_rsi <= 68:
+            score += 4
+
+        elif direction == "PUT" and 32 <= current_rsi <= 55:
+            score += 4
+
+    return round(min(95, score), 1)
+
+
 def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
-    # جميع الحسابات والاستراتيجيات تعتمد على الدقيقة فقط.
-    # candles_5m موجود مؤقتاً للتوافق مع استدعاءات النسخة القديمة.
+    # جميع الاستراتيجيات تعمل على فريم الدقيقة فقط.
+    # candles_5m محفوظ للتوافق مع النسخ السابقة.
     candles = valid_candles(candles_1m)
 
     if len(candles) < MIN_CANDLES:
@@ -372,13 +516,13 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     if not current_metrics:
         return None
 
+    # تجنب الشموع شديدة الهدوء أو شديدة العنف
     if current_metrics["range"] < average_atr * 0.35:
         return None
 
     if current_metrics["range"] > average_atr * 3.0:
         return None
 
-    # اتجاه السوق على الدقيقة فقط
     trend, ema20, ema50, ema200 = get_trend(candles)
 
     current_rsi = rsi(closes)
@@ -392,16 +536,20 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
             resistance,
             average_atr
         ),
+
         strategy_resistance_rejection(
             candles,
             support,
             resistance,
             average_atr
         ),
+
         strategy_trend_pullback(
             candles,
-            trend
+            trend,
+            average_atr
         ),
+
         strategy_breakout_retest(
             candles,
             average_atr
@@ -453,7 +601,15 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         for item in selected
     ]
 
-    score = min(100, 70 + len(selected) * 7)
+    score = calculate_signal_score(
+        selected=selected,
+        direction=direction,
+        trend=trend,
+        ema200=ema200,
+        price=price,
+        current_rsi=current_rsi,
+        metrics=current_metrics
+    )
 
     return {
         "symbol": symbol,
@@ -481,28 +637,34 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     }
 
 
-_sent = set()
-
-
 def is_new_signal(signal):
 
     if not signal:
         return False
 
+    now = time.monotonic()
+
     key = (
         signal.get("symbol"),
         signal.get("direction"),
-        tuple(signal.get("matching_strategies", [])),
-        round(float(signal.get("price", 0)), 6)
+        tuple(signal.get("matching_strategies", []))
     )
 
-    if key in _sent:
-        return False
+    previous_time = _sent.get(key)
 
-    _sent.add(key)
+    if previous_time is not None:
+        if now - previous_time < SIGNAL_COOLDOWN_SECONDS:
+            return False
 
-    if len(_sent) > 3000:
-        _sent.clear()
-        _sent.add(key)
+    _sent[key] = now
+
+    # تنظيف السجلات القديمة
+    expired = [
+        item for item, timestamp in _sent.items()
+        if now - timestamp >= SIGNAL_COOLDOWN_SECONDS
+    ]
+
+    for item in expired:
+        _sent.pop(item, None)
 
     return True
