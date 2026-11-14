@@ -11,13 +11,13 @@ from market_data import fetch_candles, fetch_otc_symbols
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 OTC Smart Analyzer\n\n"
-        "البوت يعمل.\n\n"
         "الأوامر:\n"
         "/start - بدء البوت\n"
         "/status - حالة البوت\n"
         "/analyze - طلب تحليل\n"
-        "/testdata - اختبار الشموع\n"
-        "/testsymbols - اختبار قائمة OTC"
+        "/testdata - اختبار EUR/USD OTC\n"
+        "/testsymbols - اختبار قائمة OTC\n"
+        "/testapple - اختبار Apple OTC"
     )
 
 
@@ -32,12 +32,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⏳ لم يتم تفعيل إصدار الإشارات بعد.\n"
-        "نختبر بيانات جميع أزواج OTC أولاً."
+        "نختبر بيانات جميع أدوات OTC أولاً."
     )
 
 
 async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ جاري اختبار بيانات الشموع...")
+    await update.message.reply_text("⏳ جاري اختبار EUR/USD OTC...")
 
     try:
         candles = fetch_candles(
@@ -58,39 +58,62 @@ async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as error:
-        print(f"OTCharts candle test failed: {error}")
+        print(f"Candle test failed: {error}")
         await update.message.reply_text(
             f"❌ فشل اختبار الشموع:\n{str(error)[:500]}"
         )
 
 
 async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⏳ جاري جلب قائمة أدوات Pocket Option OTC..."
-    )
+    await update.message.reply_text("⏳ جاري جلب قائمة OTC...")
 
     try:
-        data = fetch_otc_symbols()
-
-        result = json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2
-        )
-
-        print("OTCharts symbols response:")
-        print(result[:10000])
+        symbols = fetch_otc_symbols()
 
         await update.message.reply_text(
-            "✅ تم الاتصال بواجهة قائمة الأدوات!\n\n"
-            "هذه بداية الاستجابة:\n\n"
-            + result[:3000]
+            f"✅ نجح الاتصال!\n"
+            f"عدد الأدوات المتاحة: {len(symbols)}\n\n"
+            "أول 5 أدوات:\n"
+            + "\n".join(
+                f"{item['symbol']} | {item['payout']}%"
+                for item in symbols[:5]
+            )
         )
 
     except Exception as error:
-        print(f"OTCharts symbols test failed: {error}")
+        print(f"Symbols test failed: {error}")
         await update.message.reply_text(
             f"❌ فشل جلب القائمة:\n{str(error)[:500]}"
+        )
+
+
+async def testapple(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⏳ جاري اختبار شموع Apple OTC على فريم الدقيقة..."
+    )
+
+    try:
+        candles = fetch_candles(
+            symbol="#AAPL_otc",
+            timeframe=60,
+            limit=5
+        )
+
+        latest = candles[-1]
+
+        await update.message.reply_text(
+            "✅ نجح اختبار Apple OTC!\n\n"
+            f"عدد الشموع: {len(candles)}\n"
+            f"Open: {latest['open']}\n"
+            f"High: {latest['high']}\n"
+            f"Low: {latest['low']}\n"
+            f"Close: {latest['close']}"
+        )
+
+    except Exception as error:
+        print(f"Apple OTC test failed: {error}")
+        await update.message.reply_text(
+            f"❌ فشل اختبار Apple OTC:\n{str(error)[:500]}"
         )
 
 
@@ -105,6 +128,7 @@ def main():
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("testdata", testdata))
     app.add_handler(CommandHandler("testsymbols", testsymbols))
+    app.add_handler(CommandHandler("testapple", testapple))
 
     print("OTC Smart Analyzer is starting...")
     app.run_polling()
