@@ -24,6 +24,36 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def format_strategies(signal):
+    strategies = signal.get("matching_strategies", [])
+    reasons = signal.get("strategy_reasons", [])
+
+    if not strategies:
+        return "لم يتم تحديد اسم الاستراتيجية."
+
+    lines = []
+
+    for index, name in enumerate(strategies):
+        reason = (
+            reasons[index]
+            if index < len(reasons)
+            else "تحققت شروط الاستراتيجية"
+        )
+
+        lines.append(
+            f"• {name}\n  السبب: {reason}"
+        )
+
+    return "\n".join(lines)
+
+
+def format_signal_details(signal):
+    return (
+        f"📚 الاستراتيجيات المتحققة ({len(signal.get('matching_strategies', []))}):\n"
+        f"{format_strategies(signal)}"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -38,7 +68,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
         "🔍 مراقبة أفضل 5 أدوات OTC\n"
         "⏱️ تنبيه قبل الدخول بـ60 ثانية\n"
-        "📊 متابعة نتائج الصفقات مفعّلة\n\n"
+        "📊 متابعة نتائج الصفقات مفعّلة\n"
+        "🧠 استراتيجيات مستقلة متعددة\n\n"
         "/status - حالة البوت\n"
         "/analyze - تحليل يدوي\n"
         "/testsymbols - قائمة الأدوات\n\n"
@@ -59,7 +90,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الماسح: {'🟢 يعمل' if running else '🔴 متوقف'}\n"
         "الأدوات المستهدفة: 5\n"
         "التنبيه المسبق: 60 ثانية\n"
-        f"المشتركون الحاليون: {len(subscribers)}\n\n"
+        f"المشتركون الحاليون: {len(subscribers)}\n"
+        "نظام التحليل: استراتيجيات مستقلة\n\n"
         "⚠️ النتائج تجريبية فقط."
     )
 
@@ -92,27 +124,33 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected = item["symbol"]
 
         candles_1m, candles_5m = await asyncio.gather(
-            asyncio.to_thread(fetch_candles, selected, 60, 50),
-            asyncio.to_thread(fetch_candles, selected, 300, 50)
+            asyncio.to_thread(fetch_candles, selected, 60, 300),
+            asyncio.to_thread(fetch_candles, selected, 300, 300)
         )
 
-        signal = analyze_signal(candles_1m, candles_5m)
+        signal = analyze_signal(
+            candles_1m,
+            candles_5m,
+            symbol=selected
+        )
 
         if not signal:
             await update.message.reply_text(
                 f"📊 {selected}\n"
-                "لا توجد فرصة مطابقة للشروط حالياً."
+                "لا توجد استراتيجية أعطت إشارة صالحة حالياً."
             )
             return
 
-        await update.message.reply_text(
+        message = (
             "📡 تحليل يدوي تجريبي\n\n"
             f"الأداة: {selected}\n"
             f"الاتجاه: {signal['direction']}\n"
-            f"النمط: {signal['pattern']}\n"
             f"السعر المرجعي: {signal['entry_reference_price']}\n\n"
+            f"{format_signal_details(signal)}\n\n"
             "⚠️ هذا التحليل ليس إشارة دخول مباشرة."
         )
+
+        await update.message.reply_text(message)
 
     except Exception as error:
         logger.exception("Manual analysis failed")
@@ -184,12 +222,11 @@ async def post_init(app):
                 "🔔 تنبيه فرصة OTC قادمة\n\n"
                 f"الأداة: {signal['symbol']}\n"
                 f"الاتجاه المتوقع: {signal['direction']}\n"
-                f"النمط: {signal['pattern']}\n"
                 f"وقت التنبيه: {signal['alert_time']}\n"
-                f"موعد الدخول المقترح: "
-                f"{signal['planned_entry_time']}\n\n"
+                f"موعد الدخول المقترح: {signal['planned_entry_time']}\n\n"
+                f"{format_signal_details(signal)}\n\n"
                 "⏳ الدخول المقترح بعد 60 ثانية.\n"
-                "سيعيد البوت فحص الشروط قبل تأكيد الدخول.\n"
+                "سيعيد البوت فحص الاستراتيجية قبل تأكيد الدخول.\n"
                 "لا تدخل اعتماداً على هذا التنبيه وحده."
             )
 
@@ -198,12 +235,11 @@ async def post_init(app):
                 "🚨 تأكيد دخول تجريبي\n\n"
                 f"الأداة: {signal['symbol']}\n"
                 f"الاتجاه: {signal['direction']}\n"
-                f"النمط: {signal['pattern']}\n"
                 f"وقت الدخول الافتراضي: {signal['entry_time']}\n"
-                f"السعر المرجعي: {signal['entry_price']}\n"
+                f"السعر المرجعي: {signal['entry_price']}\n\n"
+                f"{format_signal_details(signal)}\n\n"
                 "مدة الصفقة التجريبية: دقيقة واحدة\n\n"
-                "⚠️ هذه صفقة افتراضية وليست أمراً "
-                "للتداول الحقيقي."
+                "⚠️ هذه صفقة افتراضية وليست أمراً للتداول الحقيقي."
             )
 
         elif phase == "CANCELLED":
@@ -211,9 +247,9 @@ async def post_init(app):
                 "❌ تم إلغاء فرصة OTC\n\n"
                 f"الأداة: {signal['symbol']}\n"
                 f"الاتجاه السابق: {signal['direction']}\n"
-                f"موعد الدخول الذي كان مقترحاً: "
-                f"{signal['planned_entry_time']}\n"
+                f"موعد الدخول: {signal['planned_entry_time']}\n"
                 f"السبب: {signal['cancel_reason']}\n\n"
+                f"{format_signal_details(signal)}\n\n"
                 "لم يتم تسجيل صفقة لهذه الفرصة."
             )
 
@@ -225,10 +261,12 @@ async def post_init(app):
 
     async def notify_result(result):
         labels = {
-            "WIN": "🟢 WIN — ربح افتراضي",
-            "LOSS": "🔴 LOSS — خسارة افتراضية",
+            "WIN": "🟢 WIN — نتيجة افتراضية",
+            "LOSS": "🔴 LOSS — نتيجة افتراضية",
             "DRAW": "🟡 DRAW — تعادل"
         }
+
+        strategies = result.get("strategies", [])
 
         message = (
             "📊 نتيجة الصفقة التجريبية\n\n"
@@ -239,8 +277,10 @@ async def post_init(app):
             f"سعر النهاية: {result['exit_price']}\n"
             f"وقت البداية: {result['entry_time']}\n"
             f"وقت النهاية: {result['exit_time']}\n\n"
-            "⚠️ النتيجة محسوبة من أسعار OTCharts، "
-            "وليست نتيجة تسوية Pocket Option الفعلية."
+            "الاستراتيجيات:\n"
+            + "\n".join(f"• {s}" for s in strategies)
+            + "\n\n⚠️ النتيجة محسوبة من أسعار OTCharts، "
+            "وليست تسوية Pocket Option الفعلية."
         )
 
         return await send_to_subscribers(app, message)
