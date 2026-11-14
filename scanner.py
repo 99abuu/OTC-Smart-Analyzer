@@ -10,6 +10,12 @@ from statistics import mean
 from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
 from signal_engine import analyze_signal, is_new_signal
 
+from trade_history import (
+    record_signal,
+    record_update,
+    record_result
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +98,6 @@ def market_score(candles, payout):
 
     average_range = mean(ranges)
 
-    # نفضّل التذبذب المعتدل، وليس السوق شديد الهدوء أو العنيف.
     volatility_score = max(
         0,
         100 - abs(average_range - 0.12) / 0.20 * 100
@@ -114,10 +119,8 @@ def market_score(candles, payout):
     else:
         consistency = 0
 
-    # وضوح الحركة: هل توجد حركة اتجاهية أم حركة عشوائية؟
     trend_score = min(100, consistency)
 
-    # تقييم تكرار الاقتراب من القمم والقيعان المحلية.
     average_atr = mean([
         c["high"] - c["low"] for c in recent
     ])
@@ -208,8 +211,6 @@ def rank_otc_markets(current_symbols=None):
         and item.get("symbol")
     ]
 
-    # استخدام الـPayout لتكوين قائمة مرشحة فقط.
-    # الترتيب النهائي يتم حسب التقييم المركب.
     open_symbols.sort(
         key=lambda item: parse_number(item.get("payout")),
         reverse=True
@@ -218,8 +219,6 @@ def rank_otc_markets(current_symbols=None):
     candidates = []
     seen = set()
 
-    # الاحتفاظ بالأسواق الحالية ضمن القائمة المرشحة
-    # لتقليل التغييرات غير الضرورية.
     by_symbol = {
         item["symbol"]: item for item in open_symbols
     }
@@ -380,6 +379,8 @@ async def scanner_loop(send_signal, send_result):
     logger.info("OTC Smart Analyzer starting")
     logger.info("Analysis timeframe: 1m only")
     logger.info("Dynamic market selection enabled")
+    logger.info("Trade history recording enabled")
+
     logger.info(
         "Market refresh interval: %s seconds",
         MARKET_REFRESH_SECONDS
@@ -440,6 +441,12 @@ async def scanner_loop(send_signal, send_result):
         message["status"] = "CANCELLED"
         message["reason"] = reason
 
+        record_update(
+            alert.get("history_id"),
+            "CANCELLED",
+            {"reason": reason}
+        )
+
         try:
             await send_signal(message)
         except Exception:
@@ -474,7 +481,6 @@ async def scanner_loop(send_signal, send_result):
             )
             return True
 
-        # لا نقطع أي تنبيه أو صفقة مفتوحة.
         if pending_alerts or pending_trades:
             return False
 
@@ -526,7 +532,6 @@ async def scanner_loop(send_signal, send_result):
 
     try:
         while True:
-            # تحديث تقييم الأسواق كل 5 دقائق.
             if time.monotonic() >= next_refresh:
                 next_refresh = (
                     time.monotonic() + MARKET_REFRESH_SECONDS
@@ -573,7 +578,6 @@ async def scanner_loop(send_signal, send_result):
                         "Dynamic market refresh failed"
                     )
 
-            # تطبيق الاختيار المؤجل بعد انتهاء الصفقات والتنبيهات.
             if (
                 pending_selection
                 and not pending_alerts
@@ -651,6 +655,24 @@ async def scanner_loop(send_signal, send_result):
                             "strategy_reasons", []
                         )
                     }
+
+                    # حفظ النتيجة قبل إرسال رسالة Telegram.
+                    record_result(
+                        trade.get("history_id"),
+                        result,
+                        entry_price=trade["entry_price"],
+                        exit_price=exit_price,
+                        details={
+                            "symbol": symbol,
+                            "direction": trade["direction"],
+                            "strategies": trade.get("strategies", []),
+                            "strategy_reasons": trade.get(
+                                "strategy_reasons", []
+                            ),
+                            "entry_time": trade["entry_time"],
+                            "exit_time": timestamp
+                        }
+                    )
 
                     await send_result(result_data)
 
@@ -745,6 +767,11 @@ async def scanner_loop(send_signal, send_result):
                                 delivered = False
 
                             if not delivered:
+                                record_update(
+                                    alert.get("history_id"),
+                                    "ENTRY_NOT_DELIVERED"
+                                )
+
                                 pending_alerts.pop(symbol, None)
 
                                 logger.warning(
@@ -755,6 +782,15 @@ async def scanner_loop(send_signal, send_result):
                                 continue
 
                             alert["status"] = "CONFIRMED"
+
+                            record_update(
+                                alert.get("history_id"),
+                                "CONFIRMED",
+                                {
+                                    "confirmation": reason,
+                                    "confirmation_price": price
+                                }
+                            )
 
                             logger.info(
                                 "SIGNAL CONFIRMED AND DELIVERED: %s | %s",
@@ -806,8 +842,19 @@ async def scanner_loop(send_signal, send_result):
                             ),
                             "strategy_reasons": list(
                                 signal.get("strategy_reasons", [])
-                            )
+                            ),
+                            "history_id": alert.get("history_id")
                         }
+
+                        record_update(
+                            alert.get("history_id"),
+                            "PAPER_TRADE_STARTED",
+                            {
+                                "entry_price": price,
+                                "entry_time": timestamp,
+                                "settles_at": timestamp + TRADE_DURATION
+                            }
+                        )
 
                         logger.info(
                             "PAPER TRADE STARTED: %s | %s | Strategies=%s",
@@ -819,7 +866,6 @@ async def scanner_loop(send_signal, send_result):
                         pending_alerts.pop(symbol, None)
                         continue
 
-                # لا نفتح تنبيهاً جديداً أثناء وجود صفقة أو تنبيه.
                 if symbol in pending_trades:
                     continue
 
@@ -858,7 +904,8 @@ async def scanner_loop(send_signal, send_result):
                     "signal": signal,
                     "entry_at": entry_at,
                     "confirm_at": confirm_at,
-                    "status": "WAIT_CONFIRM"
+                    "status": "WAIT_CONFIRM",
+                    "history_id": None
                 }
 
                 logger.info(
@@ -888,6 +935,20 @@ async def scanner_loop(send_signal, send_result):
                         symbol
                     )
                     continue
+
+                # تسجيل الإشارة بعد نجاح إرسال التنبيه.
+                history_id = record_signal(signal)
+                alert["history_id"] = history_id
+
+                if history_id:
+                    record_update(
+                        history_id,
+                        "PRE_ALERT_DELIVERED",
+                        {
+                            "entry_at": entry_at,
+                            "confirm_at": confirm_at
+                        }
+                    )
 
                 pending_alerts[symbol] = alert
                 last_signal_time[symbol] = timestamp
