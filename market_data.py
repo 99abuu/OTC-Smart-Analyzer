@@ -87,4 +87,20 @@ def fetch_otc_symbols():
 
     data = make_request(f"{SYMBOLS_URL}?{params}")
 
-    return data
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid symbols response")
+
+    symbols = data.get("symbols")
+
+    if not isinstance(symbols, list):
+        raise RuntimeError("Symbols list is missing")
+
+    available_symbols = [
+        item for item in symbols
+        if isinstance(item, dict)
+        and item.get("isOtc") is True
+        and item.get("open") is True
+        and isinstance(item.get("symbol"), str)
+    ]
+
+    return available_symbols
