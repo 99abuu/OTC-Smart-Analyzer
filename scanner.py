@@ -10,13 +10,15 @@ from market_data import (
     fetch_candles,
     stream_ticks
 )
-from signal_engine import analyze_signal, is_new_signal
+from signal_engine import analyze_signal, is_new_signal, ema
 
 logger = logging.getLogger(__name__)
 
 MAX_SYMBOLS = 5
 TRADE_DURATION = 60
 PRE_ENTRY_SECONDS = 60
+CONFIRM_BEFORE_ENTRY = 15
+MAX_ENTRY_DELAY = 10
 MAX_CANDLES = 100
 
 
@@ -63,8 +65,70 @@ def add_candle(candles, candle):
         del candles[:-MAX_CANDLES]
 
 
+def validate_pending_signal(alert, price, candles_1m, candles_5m):
+    """
+    نتحقق من استمرار الاتجاه وحركة السعر.
+    لا نطلب ظهور نموذج شمعة جديد.
+    """
+
+    if len(candles_1m) < 25 or len(candles_5m) < 25:
+        return False, "بيانات الشموع غير كافية"
+
+    closes_5m = [c["close"] for c in candles_5m]
+
+    fast = ema(closes_5m, 9)
+    slow = ema(closes_5m, 21)
+
+    if fast is None or slow is None:
+        return False, "تعذر حساب اتجاه السوق"
+
+    if fast > slow:
+        current_trend = "CALL"
+    elif fast < slow:
+        current_trend = "PUT"
+    else:
+        return False, "اتجاه السوق غير واضح"
+
+    direction = alert["signal"]["direction"]
+
+    if current_trend != direction:
+        return False, "اتجاه 5 دقائق تغيّر"
+
+    recent_ranges = [
+        c["high"] - c["low"]
+        for c in candles_1m[-11:-1]
+    ]
+
+    average_range = (
+        sum(recent_ranges) / len(recent_ranges)
+        if recent_ranges else 0
+    )
+
+    if average_range <= 0:
+        return False, "حركة السعر غير كافية للتحقق"
+
+    alert_price = alert["alert_price"]
+
+    if direction == "CALL":
+        adverse_move = alert_price - price
+        favorable_move = price - alert_price
+    else:
+        adverse_move = price - alert_price
+        favorable_move = alert_price - price
+
+    # إلغاء فقط إذا تحرك السعر ضد الإشارة بشكل واضح
+    if adverse_move > average_range * 0.75:
+        return False, "السعر تحرك ضد الإشارة بشكل واضح"
+
+    # لا نلاحق السعر إذا ابتعد كثيراً في الاتجاه المتوقع
+    if favorable_move > average_range * 1.5:
+        return False, "السعر تحرك بعيداً عن منطقة الدخول"
+
+    return True, "الاتجاه والسعر ما زالا مناسبين"
+
+
 async def scanner_loop(send_signal, send_result):
-    logger.info("OTC pre-entry scanner starting")
+    logger.info("OTC pre-entry confirmation scanner starting")
 
     symbols_data = await asyncio.to_thread(fetch_otc_symbols)
 
@@ -117,7 +181,7 @@ async def scanner_loop(send_signal, send_result):
     pending_alerts = {}
     pending_trades = {}
 
-    async def notify_cancel(symbol, alert, reason):
+    async def cancel_alert(symbol, alert, reason):
         message = dict(alert["signal"])
         message.update({
             "symbol": symbol,
@@ -132,6 +196,12 @@ async def scanner_loop(send_signal, send_result):
             await send_signal(message)
         except Exception:
             logger.exception("Cancellation notification failed")
+
+        logger.info(
+            "Signal cancelled: %s | %s",
+            symbol,
+            reason
+        )
 
     async def process_tick(tick):
         symbol = tick.get("symbol")
@@ -148,7 +218,7 @@ async def scanner_loop(send_signal, send_result):
         price = float(price)
         timestamp = float(timestamp)
 
-        # تسوية الصفقات التي أُرسل إشعار دخولها بنجاح فقط
+        # معالجة نتائج الصفقات التي تم تأكيد دخولها فقط
         trade = pending_trades.get(symbol)
 
         if trade and timestamp >= trade["settles_at"]:
@@ -209,151 +279,189 @@ async def scanner_loop(send_signal, send_result):
             previous["high"] = max(previous["high"], price)
             previous["low"] = min(previous["low"], price)
             previous["close"] = price
-            return
 
-        # إغلاق شمعة الدقيقة السابقة
-        if minute_bucket == previous["bucket"] + 1:
-            closed_candle = {
-                "open": previous["open"],
-                "high": previous["high"],
-                "low": previous["low"],
-                "close": previous["close"]
-            }
-
-            add_candle(candles_1m[symbol], closed_candle)
-
-            five_bucket = previous["bucket"] // 5
-            builder = building_5m.get(symbol)
-
-            if builder is None:
-                building_5m[symbol] = {
-                    "bucket": five_bucket,
-                    "open": closed_candle["open"],
-                    "high": closed_candle["high"],
-                    "low": closed_candle["low"],
-                    "close": closed_candle["close"],
-                    "count": 1
+        else:
+            # إغلاق شمعة الدقيقة السابقة
+            if minute_bucket == previous["bucket"] + 1:
+                closed_candle = {
+                    "open": previous["open"],
+                    "high": previous["high"],
+                    "low": previous["low"],
+                    "close": previous["close"]
                 }
 
-            elif five_bucket == builder["bucket"]:
-                builder["high"] = max(
-                    builder["high"], closed_candle["high"]
-                )
-                builder["low"] = min(
-                    builder["low"], closed_candle["low"]
-                )
-                builder["close"] = closed_candle["close"]
-                builder["count"] += 1
+                add_candle(candles_1m[symbol], closed_candle)
+
+                five_bucket = previous["bucket"] // 5
+                builder = building_5m.get(symbol)
+
+                if builder is None:
+                    building_5m[symbol] = {
+                        "bucket": five_bucket,
+                        "open": closed_candle["open"],
+                        "high": closed_candle["high"],
+                        "low": closed_candle["low"],
+                        "close": closed_candle["close"],
+                        "count": 1
+                    }
+
+                elif five_bucket == builder["bucket"]:
+                    builder["high"] = max(
+                        builder["high"], closed_candle["high"]
+                    )
+                    builder["low"] = min(
+                        builder["low"], closed_candle["low"]
+                    )
+                    builder["close"] = closed_candle["close"]
+                    builder["count"] += 1
+
+                else:
+                    if (
+                        five_bucket == builder["bucket"] + 1
+                        and builder["count"] == 5
+                    ):
+                        add_candle(
+                            candles_5m[symbol],
+                            {
+                                "open": builder["open"],
+                                "high": builder["high"],
+                                "low": builder["low"],
+                                "close": builder["close"]
+                            }
+                        )
+
+                        logger.info(
+                            "5m candle completed: %s",
+                            symbol
+                        )
+
+                    building_5m[symbol] = {
+                        "bucket": five_bucket,
+                        "open": closed_candle["open"],
+                        "high": closed_candle["high"],
+                        "low": closed_candle["low"],
+                        "close": closed_candle["close"],
+                        "count": 1
+                    }
 
             else:
-                if (
-                    five_bucket == builder["bucket"] + 1
-                    and builder["count"] == 5
-                ):
-                    add_candle(
-                        candles_5m[symbol],
-                        {
-                            "open": builder["open"],
-                            "high": builder["high"],
-                            "low": builder["low"],
-                            "close": builder["close"]
-                        }
+                logger.warning(
+                    "Missing minute data for %s",
+                    symbol
+                )
+                building_5m.pop(symbol, None)
+
+            current_1m[symbol] = {
+                "bucket": minute_bucket,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price
+            }
+
+        # فحص التنبيه المسبق
+        alert = pending_alerts.get(symbol)
+
+        if alert:
+            # مرحلة التأكيد: قبل الدخول بـ15 ثانية
+            if (
+                alert["status"] == "WAIT_CONFIRM"
+                and timestamp >= alert["confirm_at"]
+            ):
+                if timestamp >= alert["entry_at"]:
+                    del pending_alerts[symbol]
+
+                    await cancel_alert(
+                        symbol,
+                        alert,
+                        "لم تصل بيانات التحقق قبل موعد الدخول"
                     )
+                    return
+
+                valid, reason = validate_pending_signal(
+                    alert,
+                    price,
+                    candles_1m[symbol],
+                    candles_5m[symbol]
+                )
+
+                if not valid:
+                    del pending_alerts[symbol]
+                    await cancel_alert(symbol, alert, reason)
+                    return
+
+                confirmation = dict(alert["signal"])
+                confirmation.update({
+                    "symbol": symbol,
+                    "phase": "ENTRY",
+                    "entry_time": format_time(alert["entry_at"]),
+                    "entry_price": "يُحدد عند موعد الدخول",
+                    "expiry_minutes": 1
+                })
+
+                try:
+                    delivered = await send_signal(confirmation)
+                except Exception:
+                    logger.exception("Confirmation delivery failed")
+                    delivered = False
+
+                if delivered:
+                    alert["status"] = "CONFIRMED"
 
                     logger.info(
-                        "5m candle completed: %s",
+                        "ENTRY CONFIRMED BEFORE ENTRY: %s %s",
+                        symbol,
+                        alert["signal"]["direction"]
+                    )
+                else:
+                    del pending_alerts[symbol]
+
+                    logger.warning(
+                        "Confirmation not delivered; no trade: %s",
                         symbol
                     )
 
-                building_5m[symbol] = {
-                    "bucket": five_bucket,
-                    "open": closed_candle["open"],
-                    "high": closed_candle["high"],
-                    "low": closed_candle["low"],
-                    "close": closed_candle["close"],
-                    "count": 1
-                }
+                    return
 
-        else:
-            logger.warning(
-                "Missing minute data for %s",
-                symbol
-            )
-            building_5m.pop(symbol, None)
-
-        # تحديث الشمعة الحالية
-        current_1m[symbol] = {
-            "bucket": minute_bucket,
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price
-        }
-
-        # إعادة فحص الإشارة التي تنتظر موعد الدخول
-        alert = pending_alerts.get(symbol)
-
-        if alert and timestamp >= alert["entry_at"]:
-            del pending_alerts[symbol]
-
-            confirmed = analyze_signal(
-                candles_1m[symbol],
-                candles_5m[symbol]
-            )
-
+            # مرحلة الدخول: لا نرسل رسالة جديدة عند موعد الدخول
             if (
-                confirmed is None
-                or confirmed["direction"] != alert["signal"]["direction"]
+                alert["status"] == "CONFIRMED"
+                and timestamp >= alert["entry_at"]
             ):
-                await notify_cancel(
-                    symbol,
-                    alert,
-                    "تغيرت شروط السوق قبل الدخول"
-                )
-                logger.info("Signal cancelled: %s", symbol)
-                return
+                delay = timestamp - alert["entry_at"]
 
-            entry_message = dict(confirmed)
-            entry_message.update({
-                "symbol": symbol,
-                "phase": "ENTRY",
-                "entry_price": price,
-                "entry_time": format_time(timestamp),
-                "expiry_minutes": 1
-            })
+                if delay > MAX_ENTRY_DELAY:
+                    del pending_alerts[symbol]
 
-            # لا نسجل الصفقة إلا إذا وصل إشعار الدخول بنجاح
-            try:
-                delivered = await send_signal(entry_message)
-            except Exception:
-                logger.exception("Entry notification failed")
-                delivered = False
+                    logger.warning(
+                        "Entry missed due to delayed tick: %s | %.1fs",
+                        symbol,
+                        delay
+                    )
+                    return
 
-            if delivered:
                 pending_trades[symbol] = {
-                    "direction": confirmed["direction"],
+                    "direction": alert["signal"]["direction"],
                     "entry_price": price,
                     "entry_time": timestamp,
                     "settles_at": timestamp + TRADE_DURATION
                 }
 
                 logger.info(
-                    "Entry notification sent: %s %s",
+                    "PAPER TRADE STARTED: %s %s at %s",
                     symbol,
-                    confirmed["direction"]
+                    alert["signal"]["direction"],
+                    price
                 )
-            else:
-                logger.warning(
-                    "Entry not recorded because notification failed: %s",
-                    symbol
-                )
+
+                del pending_alerts[symbol]
+                return
 
             return
 
-        # لا نفتح تنبيهاً جديداً أثناء وجود تنبيه أو صفقة
+        # منع فتح فرصة جديدة أثناء وجود صفقة قائمة
         if (
-            symbol in pending_alerts
-            or symbol in pending_trades
+            symbol in pending_trades
             or len(candles_1m[symbol]) < 25
             or len(candles_5m[symbol]) < 25
         ):
@@ -367,37 +475,43 @@ async def scanner_loop(send_signal, send_result):
         if not signal or not is_new_signal(symbol, signal):
             return
 
-        planned_entry = timestamp + PRE_ENTRY_SECONDS
+        entry_at = timestamp + PRE_ENTRY_SECONDS
+        confirm_at = entry_at - CONFIRM_BEFORE_ENTRY
 
         pre_alert = dict(signal)
         pre_alert.update({
             "symbol": symbol,
             "phase": "PRE_ALERT",
             "alert_time": format_time(timestamp),
-            "planned_entry_time": format_time(planned_entry),
+            "planned_entry_time": format_time(entry_at),
             "seconds_until_entry": PRE_ENTRY_SECONDS
         })
 
         try:
             delivered = await send_signal(pre_alert)
         except Exception:
-            logger.exception("Pre-entry notification failed")
+            logger.exception("Pre-alert delivery failed")
             delivered = False
 
         if delivered:
             pending_alerts[symbol] = {
                 "signal": signal,
-                "entry_at": planned_entry
+                "alert_price": price,
+                "confirm_at": confirm_at,
+                "entry_at": entry_at,
+                "status": "WAIT_CONFIRM"
             }
 
             logger.info(
-                "Pre-entry alert sent: %s %s",
+                "PRE-ENTRY ALERT SENT: %s %s | confirm=%s | entry=%s",
                 symbol,
-                signal["direction"]
+                signal["direction"],
+                format_time(confirm_at),
+                format_time(entry_at)
             )
         else:
             logger.warning(
-                "Pre-entry alert was not delivered: %s",
+                "Pre-alert not delivered; no pending signal: %s",
                 symbol
             )
 
@@ -409,6 +523,7 @@ async def scanner_loop(send_signal, send_result):
                     True,
                     1
                 )
+
                 await process_tick(tick)
 
             except queue.Empty:
