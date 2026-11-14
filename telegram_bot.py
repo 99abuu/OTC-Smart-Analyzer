@@ -36,18 +36,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 OTC Smart Analyzer\n\n"
         "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
-        "🔍 مراقبة أفضل 5 أدوات OTC\n"
-        "⏱️ دورة الفحص كل 3 دقائق\n\n"
+        "🔍 مراقبة 5 أدوات OTC\n"
+        "⏱️ دورة الفحص كل 3 دقائق\n"
+        "📊 متابعة نتائج الصفقات مفعّلة\n\n"
         "/status - حالة البوت\n"
         "/analyze - تحليل يدوي\n"
         "/testsymbols - قائمة الأدوات\n\n"
-        "⚠️ الإشارات تجريبية وليست ضماناً للربح."
+        "⚠️ النتائج تجريبية وليست ضماناً للربح."
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = context.application.bot_data.get("scanner_task")
-
     running = task is not None and not task.done()
 
     await update.message.reply_text(
@@ -55,7 +55,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الماسح: {'🟢 يعمل' if running else '🔴 متوقف'}\n"
         "الأدوات المستهدفة: 5\n"
         "الفاصل المستهدف: 3 دقائق\n"
-        "استقبال الإشارات: مفعّل عند /start\n\n"
+        "متابعة النتائج: مفعّلة\n\n"
         "⚠️ النتائج تجريبية فقط."
     )
 
@@ -70,8 +70,10 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if symbol:
             item = next(
-                (s for s in symbols
-                 if s["symbol"].lower() == symbol.lower()),
+                (
+                    s for s in symbols
+                    if s["symbol"].lower() == symbol.lower()
+                ),
                 None
             )
         else:
@@ -103,13 +105,13 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            "📡 إشارة تجريبية\n\n"
+            "📡 نتيجة تحليل يدوي تجريبية\n\n"
             f"الأداة: {selected}\n"
             f"الاتجاه: {signal['direction']}\n"
             f"النمط: {signal['pattern']}\n"
             f"السعر المرجعي: {signal['entry_reference_price']}\n"
             "الانتهاء المقترح: دقيقة واحدة\n\n"
-            "⚠️ اختبرها على الحساب التجريبي فقط."
+            "⚠️ هذا التحليل لا يتضمن توقيت دخول مباشر."
         )
 
     except Exception as error:
@@ -149,14 +151,15 @@ async def post_init(app):
             f"الأداة: {signal['symbol']}\n"
             f"الاتجاه: {signal['direction']}\n"
             f"النمط: {signal['pattern']}\n"
-            f"السعر المرجعي: {signal['entry_reference_price']}\n"
-            "الانتهاء المقترح: دقيقة واحدة\n\n"
-            "⚠️ إشارة آلية أولية. اختبرها تجريبياً فقط."
+            f"وقت الإشارة: {signal['entry_time']}\n"
+            "المنطقة الزمنية: UTC\n"
+            f"سعر الدخول المرجعي: {signal['entry_price']}\n"
+            "مدة الصفقة: دقيقة واحدة\n\n"
+            "⚠️ السعر المرجعي مأخوذ من بث OTCharts، "
+            "وقد يختلف عن سعر دخولك الفعلي."
         )
 
-        for chat_id in list(
-            app.bot_data.get("subscribers", [])
-        ):
+        for chat_id in list(app.bot_data.get("subscribers", [])):
             try:
                 await app.bot.send_message(
                     chat_id=chat_id,
@@ -168,13 +171,45 @@ async def post_init(app):
                     chat_id
                 )
 
+    async def notify_result(result):
+        labels = {
+            "WIN": "🟢 WIN — ربح افتراضي",
+            "LOSS": "🔴 LOSS — خسارة افتراضية",
+            "DRAW": "🟡 DRAW — تعادل"
+        }
+
+        message = (
+            "📊 نتيجة الصفقة التجريبية\n\n"
+            f"{labels.get(result['result'], result['result'])}\n\n"
+            f"الأداة: {result['symbol']}\n"
+            f"الاتجاه: {result['direction']}\n"
+            f"سعر البداية: {result['entry_price']}\n"
+            f"سعر النهاية: {result['exit_price']}\n"
+            f"وقت البداية: {result['entry_time']}\n"
+            f"وقت النهاية: {result['exit_time']}\n\n"
+            "⚠️ النتيجة محسوبة من أسعار OTCharts "
+            "وليست نتيجة تسوية Pocket Option الفعلية."
+        )
+
+        for chat_id in list(app.bot_data.get("subscribers", [])):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=message
+                )
+            except Exception:
+                logger.exception(
+                    "Could not send result to chat %s",
+                    chat_id
+                )
+
     app.bot_data["subscribers"] = []
 
     app.bot_data["scanner_task"] = asyncio.create_task(
-        scanner_loop(notify)
+        scanner_loop(notify, notify_result)
     )
 
-    logger.info("Automatic scanner task started")
+    logger.info("Automatic scanner and result tracking started")
 
 
 async def post_shutdown(app):
