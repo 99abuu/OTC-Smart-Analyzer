@@ -67,6 +67,7 @@ def calculate_rsi(values, period=RSI_PERIOD):
         return 100 if avg_gain > 0 else 50
 
     rs = avg_gain / avg_loss
+
     return 100 - (100 / (1 + rs))
 
 
@@ -127,19 +128,13 @@ def candle_behavior(candle):
         - candle["low"]
     )
 
-    body_ratio = body / total_range
-    upper_ratio = upper_wick / total_range
-    lower_ratio = lower_wick / total_range
-
-    close_position = (
-        candle["close"] - candle["low"]
-    ) / total_range
-
     return {
-        "body_ratio": body_ratio,
-        "upper_ratio": upper_ratio,
-        "lower_ratio": lower_ratio,
-        "close_position": close_position,
+        "body_ratio": body / total_range,
+        "upper_ratio": upper_wick / total_range,
+        "lower_ratio": lower_wick / total_range,
+        "close_position": (
+            candle["close"] - candle["low"]
+        ) / total_range,
         "range": total_range
     }
 
@@ -151,9 +146,9 @@ def bullish_rejection(candle):
         return False
 
     return (
-        data["lower_ratio"] >= 0.40
-        and data["close_position"] >= 0.65
-        and data["upper_ratio"] <= 0.25
+        data["lower_ratio"] >= 0.35
+        and data["close_position"] >= 0.60
+        and data["upper_ratio"] <= 0.30
     )
 
 
@@ -164,9 +159,9 @@ def bearish_rejection(candle):
         return False
 
     return (
-        data["upper_ratio"] >= 0.40
-        and data["close_position"] <= 0.35
-        and data["lower_ratio"] <= 0.25
+        data["upper_ratio"] >= 0.35
+        and data["close_position"] <= 0.40
+        and data["lower_ratio"] <= 0.30
     )
 
 
@@ -207,7 +202,6 @@ def support_resistance_filter(
     distance = atr * 0.20
 
     if direction == "CALL":
-        # تجنب الشراء مباشرة أسفل مقاومة قريبة
         if (
             current_price < resistance
             and resistance - current_price <= distance
@@ -215,7 +209,6 @@ def support_resistance_filter(
             return False
 
     if direction == "PUT":
-        # تجنب البيع مباشرة فوق دعم قريب
         if (
             current_price > support
             and current_price - support <= distance
@@ -237,6 +230,7 @@ def analyze_signal(candles_1m, candles_5m):
     required = ("open", "high", "low", "close")
 
     for candle in candles_1m[-30:] + candles_5m[-25:]:
+
         if not all(
             isinstance(candle.get(field), (int, float))
             for field in required
@@ -244,6 +238,14 @@ def analyze_signal(candles_1m, candles_5m):
             return None
 
         if candle["high"] < candle["low"]:
+            return None
+
+        if (
+            candle["open"] < candle["low"]
+            or candle["open"] > candle["high"]
+            or candle["close"] < candle["low"]
+            or candle["close"] > candle["high"]
+        ):
             return None
 
     closes_1m = [c["close"] for c in candles_1m]
@@ -266,17 +268,24 @@ def analyze_signal(candles_1m, candles_5m):
 
     if fast > slow:
         direction = "CALL"
+
     elif fast < slow:
         direction = "PUT"
+
     else:
         return None
 
-    # يجب أن يتحرك المتوسط السريع في اتجاه الصفقة
-    if direction == "CALL" and fast <= previous_fast:
-        return None
+    score = 0
 
-    if direction == "PUT" and fast >= previous_fast:
-        return None
+    # توافق المتوسطات
+    score += 2
+
+    # ميل EMA أصبح نقطة تقييم وليس شرط إلغاء
+    if direction == "CALL" and fast > previous_fast:
+        score += 1
+
+    elif direction == "PUT" and fast < previous_fast:
+        score += 1
 
     # ---------------------------------
     # 2. تحليل الشموع
@@ -296,32 +305,37 @@ def analyze_signal(candles_1m, candles_5m):
     if direction == "CALL":
         engulfing = bullish_engulfing(previous, current)
         rejection = bullish_rejection(current)
+
     else:
         engulfing = bearish_engulfing(previous, current)
         rejection = bearish_rejection(current)
 
-    # لا دخول دون نمط شمعة واضح
-    if not engulfing and not rejection:
-        return None
+    # وجود نمط واضح يمنح نقطتين
+    if engulfing or rejection:
+        score += 2
 
-    pattern = (
-        "Engulfing"
-        if engulfing
-        else "Wick Rejection"
-    )
+    if engulfing:
+        pattern = "Engulfing"
+
+    elif rejection:
+        pattern = "Wick Rejection"
+
+    else:
+        pattern = "Directional Candle"
 
     # ---------------------------------
     # 3. قياس التذبذب
     # ---------------------------------
 
-    atr = average_range(candles_1m[-15:])
+    # متوسط آخر 15 شمعة مكتملة قبل الشمعة الحالية
+    atr = average_range(candles_1m[-16:-1])
 
     if atr is None or atr <= 0:
         return None
 
     current_range = behavior["range"]
 
-    # تجنب الشموع شديدة الاندفاع
+    # استبعاد الشموع الضعيفة جداً أو المندفعة جداً
     if current_range > atr * 2.2:
         return None
 
@@ -329,7 +343,28 @@ def analyze_signal(candles_1m, candles_5m):
         return None
 
     # ---------------------------------
-    # 4. مؤشر RSI
+    # 4. جودة جسم الشمعة
+    # ---------------------------------
+
+    if behavior["body_ratio"] >= 0.35:
+        score += 1
+
+    # ---------------------------------
+    # 5. قوة الإغلاق
+    # ---------------------------------
+
+    if direction == "CALL":
+
+        if behavior["close_position"] >= 0.70:
+            score += 1
+
+    else:
+
+        if behavior["close_position"] <= 0.30:
+            score += 1
+
+    # ---------------------------------
+    # 6. مؤشر RSI
     # ---------------------------------
 
     rsi = calculate_rsi(closes_1m)
@@ -337,33 +372,31 @@ def analyze_signal(candles_1m, candles_5m):
     if rsi is None:
         return None
 
+    # نطاق أوسع من السابق
     if direction == "CALL":
-        if not 52 <= rsi <= 68:
-            return None
 
-    if direction == "PUT":
-        if not 32 <= rsi <= 48:
-            return None
+        if 48 <= rsi <= 70:
+            score += 1
 
-    # ---------------------------------
-    # 5. الزخم
-    # ---------------------------------
+    else:
 
-    if len(closes_1m) < 4:
-        return None
-
-    momentum = (
-        closes_1m[-1] - closes_1m[-4]
-    )
-
-    if direction == "CALL" and momentum <= 0:
-        return None
-
-    if direction == "PUT" and momentum >= 0:
-        return None
+        if 30 <= rsi <= 52:
+            score += 1
 
     # ---------------------------------
-    # 6. الدعم والمقاومة
+    # 7. الزخم
+    # ---------------------------------
+
+    momentum = closes_1m[-1] - closes_1m[-4]
+
+    if direction == "CALL" and momentum > 0:
+        score += 1
+
+    elif direction == "PUT" and momentum < 0:
+        score += 1
+
+    # ---------------------------------
+    # 8. الدعم والمقاومة
     # ---------------------------------
 
     sr_valid = support_resistance_filter(
@@ -373,45 +406,12 @@ def analyze_signal(candles_1m, candles_5m):
         atr
     )
 
-    if not sr_valid:
-        return None
-
-    # ---------------------------------
-    # 7. تقييم جودة الإشارة
-    # ---------------------------------
-
-    score = 0
-
-    # اتجاه EMA
-    score += 2
-
-    # ميل EMA
-    score += 1
-
-    # نمط الشمعة
-    score += 2
-
-    # جودة جسم الشمعة
-    if behavior["body_ratio"] >= 0.35:
+    if sr_valid:
         score += 1
 
-    # قوة الإغلاق
-    if direction == "CALL":
-        if behavior["close_position"] >= 0.75:
-            score += 1
-
-    if direction == "PUT":
-        if behavior["close_position"] <= 0.25:
-            score += 1
-
-    # الزخم
-    score += 1
-
-    # RSI مناسب
-    score += 1
-
-    # عدم وجود مقاومة أو دعم قريب يعاكس الدخول
-    score += 1
+    # ---------------------------------
+    # 9. القرار النهائي
+    # ---------------------------------
 
     if score < MIN_SCORE:
         return None
