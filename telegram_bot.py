@@ -16,7 +16,6 @@ from market_data import (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 OTC Smart Analyzer\n\n"
-        "الأوامر:\n"
         "/start - بدء البوت\n"
         "/status - حالة البوت\n"
         "/analyze - طلب تحليل\n"
@@ -29,8 +28,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📊 حالة البوت: يعمل\n"
-        "📈 الفريمات: 1m و 5m\n"
+        "📊 البوت يعمل\n"
         "📡 البث المباشر: قيد الاختبار\n"
         "🔍 الإشارات: لم يتم تفعيلها بعد"
     )
@@ -38,8 +36,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⏳ نظام الإشارات قيد البناء.\n"
-        "سيتم تفعيله بعد اكتمال الماسح والتحليل."
+        "⏳ نظام الإشارات قيد البناء."
     )
 
 
@@ -128,19 +125,24 @@ async def testapple(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-def read_first_stream_event(symbols):
+def read_first_tick(symbols):
     stream = stream_ticks(symbols)
 
     try:
-        return next(stream, None)
+        for event in stream:
+            if event.get("_event") == "tick":
+                return event
+
     finally:
         stream.close()
+
+    return None
 
 
 async def teststream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⏳ جاري فتح اتصال البث المباشر لخمس أدوات OTC...\n"
-        "ننتظر تأكيد الاشتراك."
+        "⏳ جاري اختبار البث المباشر...\n"
+        "تم تحديد خمس أدوات، وننتظر أول تحديث سعر."
     )
 
     try:
@@ -154,30 +156,26 @@ async def teststream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not selected:
             raise RuntimeError("No available OTC symbols")
 
-        event = await asyncio.to_thread(
-            read_first_stream_event,
-            selected
+        event = await asyncio.wait_for(
+            asyncio.to_thread(read_first_tick, selected),
+            timeout=60
         )
 
         if event is None:
-            raise RuntimeError("The stream returned no event")
-
-        event_type = event.get("_event", "message")
+            raise RuntimeError("No tick event received")
 
         await update.message.reply_text(
-            "📡 نتيجة اختبار البث:\n\n"
-            f"الأدوات المطلوبة: {len(selected)}\n"
+            "✅ وصل أول تحديث سعر مباشر!\n\n"
             f"الأدوات: {', '.join(selected)}\n\n"
-            f"نوع الحدث: {event_type}\n"
-            f"الاستجابة:\n"
-            f"{json.dumps(event, ensure_ascii=False)[:2500]}"
+            "بيانات التحديث:\n"
+            + json.dumps(event, ensure_ascii=False)[:2500]
         )
 
-        if event_type == "connected":
-            await update.message.reply_text(
-                "✅ تم فتح اتصال البث واستلام تأكيد الاشتراك.\n"
-                "الخطوة التالية: التحقق من وصول tick."
-            )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "⚠️ لم يصل تحديث سعر خلال 60 ثانية.\n"
+            "هذا لا يعني أن الاتصال فشل، لكنه يعني أننا لم نتحقق من وصول tick بعد."
+        )
 
     except Exception as error:
         print(f"Stream test failed: {error}")
@@ -190,11 +188,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
