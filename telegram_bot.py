@@ -1,19 +1,23 @@
 
+import json
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+
 from config import TELEGRAM_BOT_TOKEN
-from market_data import fetch_candles
+from market_data import fetch_candles, fetch_otc_symbols
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 OTC Smart Analyzer\n\n"
-        "البوت جاهز لاستقبال أوامرك.\n\n"
+        "البوت يعمل.\n\n"
         "الأوامر:\n"
         "/start - بدء البوت\n"
         "/status - حالة البوت\n"
         "/analyze - طلب تحليل\n"
-        "/testdata - اختبار بيانات OTC"
+        "/testdata - اختبار الشموع\n"
+        "/testsymbols - اختبار قائمة OTC"
     )
 
 
@@ -21,19 +25,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📊 حالة البوت: يعمل\n"
         "📈 الفريمات: 1m و 5m\n"
-        "🔍 اختبار بيانات السوق: لم يتم التحقق بعد"
+        "🔍 بيانات السوق: قيد الاختبار"
     )
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⏳ لم نفعّل إصدار الإشارات بعد.\n"
-        "استخدم /testdata أولاً للتحقق من اتصال بيانات السوق."
+        "⏳ لم يتم تفعيل إصدار الإشارات بعد.\n"
+        "نختبر بيانات جميع أزواج OTC أولاً."
     )
 
 
 async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ جاري اختبار اتصال OTCharts...")
+    await update.message.reply_text("⏳ جاري اختبار بيانات الشموع...")
 
     try:
         candles = fetch_candles(
@@ -45,11 +49,8 @@ async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
         latest = candles[-1]
 
         await update.message.reply_text(
-            "✅ تم استلام بيانات OTC بنجاح!\n\n"
+            "✅ اتصال الشموع ناجح!\n\n"
             f"عدد الشموع: {len(candles)}\n"
-            "الزوج: EUR/USD OTC\n"
-            "الفريم: دقيقة واحدة\n\n"
-            f"آخر شمعة:\n"
             f"Open: {latest['open']}\n"
             f"High: {latest['high']}\n"
             f"Low: {latest['low']}\n"
@@ -57,10 +58,39 @@ async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as error:
-        print(f"OTCharts test failed: {error}")
+        print(f"OTCharts candle test failed: {error}")
         await update.message.reply_text(
-            "❌ لم ينجح الاتصال ببيانات OTCharts.\n"
-            "راجع سجل التشغيل لمعرفة سبب الخطأ."
+            f"❌ فشل اختبار الشموع:\n{str(error)[:500]}"
+        )
+
+
+async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⏳ جاري جلب قائمة أدوات Pocket Option OTC..."
+    )
+
+    try:
+        data = fetch_otc_symbols()
+
+        result = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        )
+
+        print("OTCharts symbols response:")
+        print(result[:10000])
+
+        await update.message.reply_text(
+            "✅ تم الاتصال بواجهة قائمة الأدوات!\n\n"
+            "هذه بداية الاستجابة:\n\n"
+            + result[:3000]
+        )
+
+    except Exception as error:
+        print(f"OTCharts symbols test failed: {error}")
+        await update.message.reply_text(
+            f"❌ فشل جلب القائمة:\n{str(error)[:500]}"
         )
 
 
@@ -74,6 +104,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("testdata", testdata))
+    app.add_handler(CommandHandler("testsymbols", testsymbols))
 
     print("OTC Smart Analyzer is starting...")
     app.run_polling()
