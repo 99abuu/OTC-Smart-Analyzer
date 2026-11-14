@@ -1,6 +1,5 @@
 
 import asyncio
-import json
 import logging
 
 from telegram import Update
@@ -25,25 +24,39 @@ logger = logging.getLogger(__name__)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    subscribers = context.application.bot_data.setdefault(
+        "subscribers", []
+    )
+
+    if chat_id not in subscribers:
+        subscribers.append(chat_id)
+
     await update.message.reply_text(
         "🤖 OTC Smart Analyzer\n\n"
-        "✅ الماسح التلقائي مفعّل\n"
-        "🔍 يراقب أفضل 5 أدوات OTC\n"
-        "⏱️ تحديث الفحص كل 3 دقائق\n\n"
+        "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
+        "🔍 مراقبة أفضل 5 أدوات OTC\n"
+        "⏱️ دورة الفحص كل 3 دقائق\n\n"
         "/status - حالة البوت\n"
         "/analyze - تحليل يدوي\n"
-        "/testsymbols - قائمة الأدوات"
+        "/testsymbols - قائمة الأدوات\n\n"
+        "⚠️ الإشارات تجريبية وليست ضماناً للربح."
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task = context.application.bot_data.get("scanner_task")
+
+    running = task is not None and not task.done()
+
     await update.message.reply_text(
-        "📊 OTC Smart Analyzer\n\n"
-        "🟢 البوت يعمل\n"
-        "🔍 الماسح التلقائي مفعّل\n"
-        "📡 مراقبة 5 أدوات OTC\n"
-        "⏱️ دورة الفحص: 3 دقائق\n\n"
-        "⚠️ الإشارات تجريبية فقط."
+        "📊 حالة OTC Smart Analyzer\n\n"
+        f"الماسح: {'🟢 يعمل' if running else '🔴 متوقف'}\n"
+        "الأدوات المستهدفة: 5\n"
+        "الفاصل المستهدف: 3 دقائق\n"
+        "استقبال الإشارات: مفعّل عند /start\n\n"
+        "⚠️ النتائج تجريبية فقط."
     )
 
 
@@ -57,14 +70,17 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if symbol:
             item = next(
-                (s for s in symbols if s["symbol"].lower() == symbol.lower()),
+                (s for s in symbols
+                 if s["symbol"].lower() == symbol.lower()),
                 None
             )
         else:
             item = symbols[0] if symbols else None
 
         if not item:
-            await update.message.reply_text("لم يتم العثور على الأداة.")
+            await update.message.reply_text(
+                "لم يتم العثور على الأداة."
+            )
             return
 
         selected = item["symbol"]
@@ -72,6 +88,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         candles_1m = await asyncio.to_thread(
             fetch_candles, selected, 60, 50
         )
+
         candles_5m = await asyncio.to_thread(
             fetch_candles, selected, 300, 50
         )
@@ -86,12 +103,12 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            f"📡 إشارة تجريبية\n\n"
+            "📡 إشارة تجريبية\n\n"
             f"الأداة: {selected}\n"
             f"الاتجاه: {signal['direction']}\n"
             f"النمط: {signal['pattern']}\n"
             f"السعر المرجعي: {signal['entry_reference_price']}\n"
-            f"الانتهاء المقترح: دقيقة واحدة\n\n"
+            "الانتهاء المقترح: دقيقة واحدة\n\n"
             "⚠️ اختبرها على الحساب التجريبي فقط."
         )
 
@@ -125,44 +142,33 @@ async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def send_signal(signal):
-    message = (
-        "🚨 فرصة OTC تجريبية\n\n"
-        f"الأداة: {signal['symbol']}\n"
-        f"الاتجاه: {'🟢 CALL' if signal['direction'] == 'CALL' else '🔴 PUT'}\n"
-        f"النمط: {signal['pattern']}\n"
-        f"السعر المرجعي: {signal['entry_reference_price']}\n"
-        f"الانتهاء المقترح: دقيقة واحدة\n\n"
-        "⚠️ إشارة آلية أولية، وليست ضماناً للربح. اختبرها تجريبياً."
-    )
-
-    for chat_id in application.bot_data.get("subscribers", []):
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text=message
+async def post_init(app):
+    async def notify(signal):
+        message = (
+            "🚨 فرصة OTC تجريبية\n\n"
+            f"الأداة: {signal['symbol']}\n"
+            f"الاتجاه: {signal['direction']}\n"
+            f"النمط: {signal['pattern']}\n"
+            f"السعر المرجعي: {signal['entry_reference_price']}\n"
+            "الانتهاء المقترح: دقيقة واحدة\n\n"
+            "⚠️ إشارة آلية أولية. اختبرها تجريبياً فقط."
         )
 
-
-async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    subscribers = application.bot_data.setdefault("subscribers", [])
-
-    if chat_id not in subscribers:
-        subscribers.append(chat_id)
-
-    await update.message.reply_text(
-        "✅ تم تفعيل استقبال إشارات الماسح في هذه المحادثة."
-    )
-
-
-async def post_init(app):
-    global application
-    application = app
+        for chat_id in list(
+            app.bot_data.get("subscribers", [])
+        ):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=message
+                )
+            except Exception:
+                logger.exception(
+                    "Could not send signal to chat %s",
+                    chat_id
+                )
 
     app.bot_data["subscribers"] = []
-
-    async def notify(signal):
-        await send_signal(signal)
 
     app.bot_data["scanner_task"] = asyncio.create_task(
         scanner_loop(notify)
@@ -176,13 +182,11 @@ async def post_shutdown(app):
 
     if task:
         task.cancel()
+
         try:
             await task
         except asyncio.CancelledError:
             pass
-
-
-application = None
 
 
 def main():
@@ -201,7 +205,6 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("testsymbols", testsymbols))
-    app.add_handler(CommandHandler("register", register))
 
     logger.info("OTC Smart Analyzer starting...")
     app.run_polling()
