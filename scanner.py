@@ -10,7 +10,12 @@ from market_data import (
     fetch_candles,
     stream_ticks
 )
-from signal_engine import analyze_signal, is_new_signal, ema
+
+from signal_engine import (
+    analyze_signal,
+    is_new_signal,
+    ema
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ def stream_worker(symbols, tick_queue, stop_event):
 
                 if tick.get("_event") == "tick":
                     received = True
+
                     try:
                         tick_queue.put(tick, timeout=2)
                     except queue.Full:
@@ -67,14 +73,36 @@ def add_candle(candles, candle):
 
 def validate_pending_signal(alert, price, candles_1m, candles_5m):
     """
-    نتحقق من استمرار الاتجاه وحركة السعر.
-    لا نطلب ظهور نموذج شمعة جديد.
+    إعادة اختبار الاستراتيجية الكاملة قبل الدخول:
+    الاتجاه، سلوك الشمعة، RSI، الزخم،
+    الدعم والمقاومة، ودرجة جودة الإشارة.
     """
 
-    if len(candles_1m) < 25 or len(candles_5m) < 25:
+    if len(candles_1m) < 30 or len(candles_5m) < 25:
         return False, "بيانات الشموع غير كافية"
 
-    closes_5m = [c["close"] for c in candles_5m]
+    original_direction = alert["signal"]["direction"]
+
+    # إعادة تحليل الاستراتيجية المطورة
+    fresh_signal = analyze_signal(
+        candles_1m,
+        candles_5m
+    )
+
+    if fresh_signal is None:
+        return False, "شروط الاستراتيجية لم تعد مكتملة"
+
+    if fresh_signal["direction"] != original_direction:
+        return False, "اتجاه الإشارة تغير"
+
+    if fresh_signal.get("score", 0) < 8:
+        return False, "درجة جودة الإشارة منخفضة"
+
+    # التحقق من اتجاه EMA على 5 دقائق
+    closes_5m = [
+        candle["close"]
+        for candle in candles_5m
+    ]
 
     fast = ema(closes_5m, 9)
     slow = ema(closes_5m, 21)
@@ -82,53 +110,48 @@ def validate_pending_signal(alert, price, candles_1m, candles_5m):
     if fast is None or slow is None:
         return False, "تعذر حساب اتجاه السوق"
 
-    if fast > slow:
-        current_trend = "CALL"
-    elif fast < slow:
-        current_trend = "PUT"
-    else:
-        return False, "اتجاه السوق غير واضح"
+    if original_direction == "CALL" and fast <= slow:
+        return False, "الاتجاه الصاعد لم يعد مؤكداً"
 
-    direction = alert["signal"]["direction"]
+    if original_direction == "PUT" and fast >= slow:
+        return False, "الاتجاه الهابط لم يعد مؤكداً"
 
-    if current_trend != direction:
-        return False, "اتجاه 5 دقائق تغيّر"
-
+    # فحص حركة السعر منذ إرسال الإشارة
     recent_ranges = [
-        c["high"] - c["low"]
-        for c in candles_1m[-11:-1]
+        candle["high"] - candle["low"]
+        for candle in candles_1m[-11:-1]
     ]
 
-    average_range = (
-        sum(recent_ranges) / len(recent_ranges)
-        if recent_ranges else 0
-    )
+    if not recent_ranges:
+        return False, "بيانات حركة السعر غير كافية"
 
-    if average_range <= 0:
-        return False, "حركة السعر غير كافية للتحقق"
+    avg_range = sum(recent_ranges) / len(recent_ranges)
+
+    if avg_range <= 0:
+        return False, "متوسط حركة السعر غير صالح"
 
     alert_price = alert["alert_price"]
 
-    if direction == "CALL":
+    if original_direction == "CALL":
         adverse_move = alert_price - price
         favorable_move = price - alert_price
+
     else:
         adverse_move = price - alert_price
         favorable_move = alert_price - price
 
-    # إلغاء فقط إذا تحرك السعر ضد الإشارة بشكل واضح
-    if adverse_move > average_range * 0.75:
-        return False, "السعر تحرك ضد الإشارة بشكل واضح"
+    if adverse_move > avg_range * 0.75:
+        return False, "السعر تحرك ضد الإشارة"
 
-    # لا نلاحق السعر إذا ابتعد كثيراً في الاتجاه المتوقع
-    if favorable_move > average_range * 1.5:
-        return False, "السعر تحرك بعيداً عن منطقة الدخول"
+    if favorable_move > avg_range * 1.5:
+        return False, "السعر ابتعد كثيراً عن منطقة الدخول"
 
-    return True, "الاتجاه والسعر ما زالا مناسبين"
+    return True, "الاستراتيجية الكاملة ما زالت متوافقة"
 
 
 async def scanner_loop(send_signal, send_result):
-    logger.info("OTC pre-entry confirmation scanner starting")
+
+    logger.info("OTC advanced confirmation scanner starting")
 
     symbols_data = await asyncio.to_thread(fetch_otc_symbols)
 
@@ -138,7 +161,11 @@ async def scanner_loop(send_signal, send_result):
     )
 
     selected = symbols_data[:MAX_SYMBOLS]
-    symbols = [item["symbol"] for item in selected]
+
+    symbols = [
+        item["symbol"]
+        for item in selected
+    ]
 
     if not symbols:
         logger.error("No OTC symbols available")
@@ -150,9 +177,20 @@ async def scanner_loop(send_signal, send_result):
     candles_5m = {}
 
     for symbol in symbols:
+
         history_1m, history_5m = await asyncio.gather(
-            asyncio.to_thread(fetch_candles, symbol, 60, 50),
-            asyncio.to_thread(fetch_candles, symbol, 300, 50)
+            asyncio.to_thread(
+                fetch_candles,
+                symbol,
+                60,
+                50
+            ),
+            asyncio.to_thread(
+                fetch_candles,
+                symbol,
+                300,
+                50
+            )
         )
 
         candles_1m[symbol] = list(history_1m)
@@ -173,6 +211,7 @@ async def scanner_loop(send_signal, send_result):
         args=(symbols, tick_queue, stop_event),
         daemon=True
     )
+
     worker.start()
 
     current_1m = {}
@@ -182,7 +221,9 @@ async def scanner_loop(send_signal, send_result):
     pending_trades = {}
 
     async def cancel_alert(symbol, alert, reason):
+
         message = dict(alert["signal"])
+
         message.update({
             "symbol": symbol,
             "phase": "CANCELLED",
@@ -194,6 +235,7 @@ async def scanner_loop(send_signal, send_result):
 
         try:
             await send_signal(message)
+
         except Exception:
             logger.exception("Cancellation notification failed")
 
@@ -204,6 +246,7 @@ async def scanner_loop(send_signal, send_result):
         )
 
     async def process_tick(tick):
+
         symbol = tick.get("symbol")
         price = tick.get("price")
         timestamp = tick.get("time")
@@ -218,21 +261,27 @@ async def scanner_loop(send_signal, send_result):
         price = float(price)
         timestamp = float(timestamp)
 
-        # معالجة نتائج الصفقات التي تم تأكيد دخولها فقط
+        # =================================
+        # معالجة نتائج الصفقات التجريبية
+        # =================================
+
         trade = pending_trades.get(symbol)
 
         if trade and timestamp >= trade["settles_at"]:
+
             entry = trade["entry_price"]
             direction = trade["direction"]
 
             if price == entry:
                 result = "DRAW"
+
             elif (
                 direction == "CALL" and price > entry
             ) or (
                 direction == "PUT" and price < entry
             ):
                 result = "WIN"
+
             else:
                 result = "LOSS"
 
@@ -256,13 +305,20 @@ async def scanner_loop(send_signal, send_result):
 
             try:
                 await send_result(result_data)
+
             except Exception:
                 logger.exception("Result notification failed")
 
+        # =================================
+        # بناء شموع الدقيقة والخمس دقائق
+        # =================================
+
         minute_bucket = int(timestamp // 60)
+
         previous = current_1m.get(symbol)
 
         if previous is None:
+
             current_1m[symbol] = {
                 "bucket": minute_bucket,
                 "open": price,
@@ -270,19 +326,30 @@ async def scanner_loop(send_signal, send_result):
                 "low": price,
                 "close": price
             }
+
             return
 
         if minute_bucket < previous["bucket"]:
             return
 
         if minute_bucket == previous["bucket"]:
-            previous["high"] = max(previous["high"], price)
-            previous["low"] = min(previous["low"], price)
+
+            previous["high"] = max(
+                previous["high"],
+                price
+            )
+
+            previous["low"] = min(
+                previous["low"],
+                price
+            )
+
             previous["close"] = price
 
         else:
-            # إغلاق شمعة الدقيقة السابقة
+
             if minute_bucket == previous["bucket"] + 1:
+
                 closed_candle = {
                     "open": previous["open"],
                     "high": previous["high"],
@@ -290,12 +357,17 @@ async def scanner_loop(send_signal, send_result):
                     "close": previous["close"]
                 }
 
-                add_candle(candles_1m[symbol], closed_candle)
+                add_candle(
+                    candles_1m[symbol],
+                    closed_candle
+                )
 
                 five_bucket = previous["bucket"] // 5
+
                 builder = building_5m.get(symbol)
 
                 if builder is None:
+
                     building_5m[symbol] = {
                         "bucket": five_bucket,
                         "open": closed_candle["open"],
@@ -306,20 +378,27 @@ async def scanner_loop(send_signal, send_result):
                     }
 
                 elif five_bucket == builder["bucket"]:
+
                     builder["high"] = max(
-                        builder["high"], closed_candle["high"]
+                        builder["high"],
+                        closed_candle["high"]
                     )
+
                     builder["low"] = min(
-                        builder["low"], closed_candle["low"]
+                        builder["low"],
+                        closed_candle["low"]
                     )
+
                     builder["close"] = closed_candle["close"]
                     builder["count"] += 1
 
                 else:
+
                     if (
                         five_bucket == builder["bucket"] + 1
                         and builder["count"] == 5
                     ):
+
                         add_candle(
                             candles_5m[symbol],
                             {
@@ -345,10 +424,12 @@ async def scanner_loop(send_signal, send_result):
                     }
 
             else:
+
                 logger.warning(
                     "Missing minute data for %s",
                     symbol
                 )
+
                 building_5m.pop(symbol, None)
 
             current_1m[symbol] = {
@@ -359,16 +440,22 @@ async def scanner_loop(send_signal, send_result):
                 "close": price
             }
 
+        # =================================
         # فحص التنبيه المسبق
+        # =================================
+
         alert = pending_alerts.get(symbol)
 
         if alert:
-            # مرحلة التأكيد: قبل الدخول بـ15 ثانية
+
+            # التأكيد قبل الدخول بـ15 ثانية
             if (
                 alert["status"] == "WAIT_CONFIRM"
                 and timestamp >= alert["confirm_at"]
             ):
+
                 if timestamp >= alert["entry_at"]:
+
                     del pending_alerts[symbol]
 
                     await cancel_alert(
@@ -376,6 +463,7 @@ async def scanner_loop(send_signal, send_result):
                         alert,
                         "لم تصل بيانات التحقق قبل موعد الدخول"
                     )
+
                     return
 
                 valid, reason = validate_pending_signal(
@@ -386,26 +474,38 @@ async def scanner_loop(send_signal, send_result):
                 )
 
                 if not valid:
+
                     del pending_alerts[symbol]
-                    await cancel_alert(symbol, alert, reason)
+
+                    await cancel_alert(
+                        symbol,
+                        alert,
+                        reason
+                    )
+
                     return
 
                 confirmation = dict(alert["signal"])
+
                 confirmation.update({
                     "symbol": symbol,
                     "phase": "ENTRY",
-                    "entry_time": format_time(alert["entry_at"]),
+                    "entry_time": format_time(
+                        alert["entry_at"]
+                    ),
                     "entry_price": "يُحدد عند موعد الدخول",
                     "expiry_minutes": 1
                 })
 
                 try:
                     delivered = await send_signal(confirmation)
+
                 except Exception:
                     logger.exception("Confirmation delivery failed")
                     delivered = False
 
                 if delivered:
+
                     alert["status"] = "CONFIRMED"
 
                     logger.info(
@@ -413,7 +513,9 @@ async def scanner_loop(send_signal, send_result):
                         symbol,
                         alert["signal"]["direction"]
                     )
+
                 else:
+
                     del pending_alerts[symbol]
 
                     logger.warning(
@@ -423,14 +525,20 @@ async def scanner_loop(send_signal, send_result):
 
                     return
 
-            # مرحلة الدخول: لا نرسل رسالة جديدة عند موعد الدخول
+            # =================================
+            # الدخول في الموعد المحدد
+            # بدون رسالة إضافية
+            # =================================
+
             if (
                 alert["status"] == "CONFIRMED"
                 and timestamp >= alert["entry_at"]
             ):
+
                 delay = timestamp - alert["entry_at"]
 
                 if delay > MAX_ENTRY_DELAY:
+
                     del pending_alerts[symbol]
 
                     logger.warning(
@@ -438,6 +546,7 @@ async def scanner_loop(send_signal, send_result):
                         symbol,
                         delay
                     )
+
                     return
 
                 pending_trades[symbol] = {
@@ -455,30 +564,45 @@ async def scanner_loop(send_signal, send_result):
                 )
 
                 del pending_alerts[symbol]
+
                 return
 
             return
 
-        # منع فتح فرصة جديدة أثناء وجود صفقة قائمة
+        # =================================
+        # منع تداخل الصفقات والتنبيهات
+        # =================================
+
         if (
             symbol in pending_trades
-            or len(candles_1m[symbol]) < 25
+            or len(candles_1m[symbol]) < 30
             or len(candles_5m[symbol]) < 25
         ):
             return
+
+        # =================================
+        # تحليل فرصة جديدة
+        # =================================
 
         signal = analyze_signal(
             candles_1m[symbol],
             candles_5m[symbol]
         )
 
-        if not signal or not is_new_signal(symbol, signal):
+        if not signal:
+            return
+
+        if not is_new_signal(symbol, signal):
             return
 
         entry_at = timestamp + PRE_ENTRY_SECONDS
-        confirm_at = entry_at - CONFIRM_BEFORE_ENTRY
+
+        confirm_at = (
+            entry_at - CONFIRM_BEFORE_ENTRY
+        )
 
         pre_alert = dict(signal)
+
         pre_alert.update({
             "symbol": symbol,
             "phase": "PRE_ALERT",
@@ -489,11 +613,13 @@ async def scanner_loop(send_signal, send_result):
 
         try:
             delivered = await send_signal(pre_alert)
+
         except Exception:
             logger.exception("Pre-alert delivery failed")
             delivered = False
 
         if delivered:
+
             pending_alerts[symbol] = {
                 "signal": signal,
                 "alert_price": price,
@@ -509,15 +635,20 @@ async def scanner_loop(send_signal, send_result):
                 format_time(confirm_at),
                 format_time(entry_at)
             )
+
         else:
+
             logger.warning(
                 "Pre-alert not delivered; no pending signal: %s",
                 symbol
             )
 
     try:
+
         while True:
+
             try:
+
                 tick = await asyncio.to_thread(
                     tick_queue.get,
                     True,
@@ -533,5 +664,7 @@ async def scanner_loop(send_signal, send_result):
                 logger.exception("Tick processing failed")
 
     finally:
+
         stop_event.set()
+
         logger.info("OTC scanner stopped")
