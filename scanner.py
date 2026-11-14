@@ -25,7 +25,6 @@ PRE_ENTRY_SECONDS = 60
 CONFIRM_BEFORE_ENTRY = 15
 MAX_ENTRY_DELAY = 10
 
-# Increased from 120 to 300 for EMA200
 HISTORY_1M = 300
 HISTORY_5M = 300
 
@@ -561,7 +560,8 @@ async def scanner_loop(send_signal, send_result):
         if signal is None:
             return
 
-        if not is_new_signal(symbol, signal):
+        # FIX: is_new_signal accepts one argument
+        if not is_new_signal(signal):
             return
 
         strategies = signal.get("matching_strategies", [])
