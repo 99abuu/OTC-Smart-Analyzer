@@ -1,4 +1,24 @@
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# =====================================
+# إعدادات الاستراتيجية
+# =====================================
+
+MIN_SCORE = 8
+RSI_PERIOD = 14
+TREND_PERIOD_FAST = 9
+TREND_PERIOD_SLOW = 21
+SR_LOOKBACK = 20
+
+
+# =====================================
+# EMA
+# =====================================
+
 def ema(values, period):
     if len(values) < period:
         return None
@@ -15,6 +35,45 @@ def ema(values, period):
     return result
 
 
+# =====================================
+# RSI
+# =====================================
+
+def calculate_rsi(values, period=RSI_PERIOD):
+    if len(values) <= period:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100 if avg_gain > 0 else 50
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+# =====================================
+# اتجاه الشمعة
+# =====================================
+
 def candle_direction(candle):
     if candle["close"] > candle["open"]:
         return "CALL"
@@ -24,6 +83,10 @@ def candle_direction(candle):
 
     return None
 
+
+# =====================================
+# أنماط الابتلاع
+# =====================================
 
 def bullish_engulfing(previous, current):
     return (
@@ -43,112 +106,347 @@ def bearish_engulfing(previous, current):
     )
 
 
-def bullish_rejection(candle):
-    body = abs(candle["close"] - candle["open"])
-    lower_wick = min(
-        candle["open"], candle["close"]
-    ) - candle["low"]
+# =====================================
+# تحليل الذيول والرفض
+# =====================================
 
+def candle_behavior(candle):
+    body = abs(candle["close"] - candle["open"])
     total_range = candle["high"] - candle["low"]
 
     if total_range <= 0:
+        return None
+
+    upper_wick = (
+        candle["high"]
+        - max(candle["open"], candle["close"])
+    )
+
+    lower_wick = (
+        min(candle["open"], candle["close"])
+        - candle["low"]
+    )
+
+    body_ratio = body / total_range
+    upper_ratio = upper_wick / total_range
+    lower_ratio = lower_wick / total_range
+
+    close_position = (
+        candle["close"] - candle["low"]
+    ) / total_range
+
+    return {
+        "body_ratio": body_ratio,
+        "upper_ratio": upper_ratio,
+        "lower_ratio": lower_ratio,
+        "close_position": close_position,
+        "range": total_range
+    }
+
+
+def bullish_rejection(candle):
+    data = candle_behavior(candle)
+
+    if data is None:
         return False
 
     return (
-        lower_wick >= max(body * 1.5, total_range * 0.35)
-        and candle["close"] > candle["low"] + total_range * 0.5
+        data["lower_ratio"] >= 0.40
+        and data["close_position"] >= 0.65
+        and data["upper_ratio"] <= 0.25
     )
 
 
 def bearish_rejection(candle):
-    body = abs(candle["close"] - candle["open"])
-    upper_wick = candle["high"] - max(
-        candle["open"], candle["close"]
-    )
+    data = candle_behavior(candle)
 
-    total_range = candle["high"] - candle["low"]
-
-    if total_range <= 0:
+    if data is None:
         return False
 
     return (
-        upper_wick >= max(body * 1.5, total_range * 0.35)
-        and candle["close"] < candle["low"] + total_range * 0.5
+        data["upper_ratio"] >= 0.40
+        and data["close_position"] <= 0.35
+        and data["lower_ratio"] <= 0.25
     )
 
 
+# =====================================
+# متوسط نطاق الشموع
+# =====================================
+
+def average_range(candles):
+    if not candles:
+        return None
+
+    ranges = [
+        c["high"] - c["low"]
+        for c in candles
+    ]
+
+    return sum(ranges) / len(ranges)
+
+
+# =====================================
+# تحليل الدعم والمقاومة
+# =====================================
+
+def support_resistance_filter(
+    candles,
+    direction,
+    current_price,
+    atr
+):
+    if len(candles) < SR_LOOKBACK + 1 or atr <= 0:
+        return False
+
+    history = candles[-(SR_LOOKBACK + 1):-1]
+
+    resistance = max(c["high"] for c in history)
+    support = min(c["low"] for c in history)
+
+    distance = atr * 0.20
+
+    if direction == "CALL":
+        # تجنب الشراء مباشرة أسفل مقاومة قريبة
+        if (
+            current_price < resistance
+            and resistance - current_price <= distance
+        ):
+            return False
+
+    if direction == "PUT":
+        # تجنب البيع مباشرة فوق دعم قريب
+        if (
+            current_price > support
+            and current_price - support <= distance
+        ):
+            return False
+
+    return True
+
+
+# =====================================
+# المحرك الرئيسي
+# =====================================
+
 def analyze_signal(candles_1m, candles_5m):
-    if len(candles_1m) < 25 or len(candles_5m) < 25:
+
+    if len(candles_1m) < 30 or len(candles_5m) < 25:
         return None
 
     required = ("open", "high", "low", "close")
 
-    for candle in candles_1m[-25:] + candles_5m[-25:]:
+    for candle in candles_1m[-30:] + candles_5m[-25:]:
         if not all(
             isinstance(candle.get(field), (int, float))
             for field in required
         ):
             return None
 
+        if candle["high"] < candle["low"]:
+            return None
+
+    closes_1m = [c["close"] for c in candles_1m]
     closes_5m = [c["close"] for c in candles_5m]
 
-    fast_5m = ema(closes_5m, 9)
-    slow_5m = ema(closes_5m, 21)
+    # ---------------------------------
+    # 1. اتجاه السوق على 5 دقائق
+    # ---------------------------------
 
-    if fast_5m is None or slow_5m is None:
+    fast = ema(closes_5m, TREND_PERIOD_FAST)
+    slow = ema(closes_5m, TREND_PERIOD_SLOW)
+
+    previous_fast = ema(
+        closes_5m[:-3],
+        TREND_PERIOD_FAST
+    )
+
+    if fast is None or slow is None or previous_fast is None:
         return None
 
-    if fast_5m > slow_5m:
-        trend = "CALL"
-    elif fast_5m < slow_5m:
-        trend = "PUT"
+    if fast > slow:
+        direction = "CALL"
+    elif fast < slow:
+        direction = "PUT"
     else:
         return None
+
+    # يجب أن يتحرك المتوسط السريع في اتجاه الصفقة
+    if direction == "CALL" and fast <= previous_fast:
+        return None
+
+    if direction == "PUT" and fast >= previous_fast:
+        return None
+
+    # ---------------------------------
+    # 2. تحليل الشموع
+    # ---------------------------------
 
     previous = candles_1m[-2]
     current = candles_1m[-1]
 
-    if candle_direction(current) != trend:
+    if candle_direction(current) != direction:
         return None
 
-    if trend == "CALL":
+    behavior = candle_behavior(current)
+
+    if behavior is None:
+        return None
+
+    if direction == "CALL":
         engulfing = bullish_engulfing(previous, current)
         rejection = bullish_rejection(current)
     else:
         engulfing = bearish_engulfing(previous, current)
         rejection = bearish_rejection(current)
 
+    # لا دخول دون نمط شمعة واضح
     if not engulfing and not rejection:
         return None
 
-    recent_ranges = [
-        c["high"] - c["low"]
-        for c in candles_1m[-11:-1]
-    ]
+    pattern = (
+        "Engulfing"
+        if engulfing
+        else "Wick Rejection"
+    )
 
-    average_range = sum(recent_ranges) / len(recent_ranges)
-    current_range = current["high"] - current["low"]
+    # ---------------------------------
+    # 3. قياس التذبذب
+    # ---------------------------------
 
-    if average_range <= 0:
+    atr = average_range(candles_1m[-15:])
+
+    if atr is None or atr <= 0:
         return None
 
-    if current_range > average_range * 2.5:
+    current_range = behavior["range"]
+
+    # تجنب الشموع شديدة الاندفاع
+    if current_range > atr * 2.2:
         return None
+
+    if current_range < atr * 0.25:
+        return None
+
+    # ---------------------------------
+    # 4. مؤشر RSI
+    # ---------------------------------
+
+    rsi = calculate_rsi(closes_1m)
+
+    if rsi is None:
+        return None
+
+    if direction == "CALL":
+        if not 52 <= rsi <= 68:
+            return None
+
+    if direction == "PUT":
+        if not 32 <= rsi <= 48:
+            return None
+
+    # ---------------------------------
+    # 5. الزخم
+    # ---------------------------------
+
+    if len(closes_1m) < 4:
+        return None
+
+    momentum = (
+        closes_1m[-1] - closes_1m[-4]
+    )
+
+    if direction == "CALL" and momentum <= 0:
+        return None
+
+    if direction == "PUT" and momentum >= 0:
+        return None
+
+    # ---------------------------------
+    # 6. الدعم والمقاومة
+    # ---------------------------------
+
+    sr_valid = support_resistance_filter(
+        candles_1m,
+        direction,
+        current["close"],
+        atr
+    )
+
+    if not sr_valid:
+        return None
+
+    # ---------------------------------
+    # 7. تقييم جودة الإشارة
+    # ---------------------------------
+
+    score = 0
+
+    # اتجاه EMA
+    score += 2
+
+    # ميل EMA
+    score += 1
+
+    # نمط الشمعة
+    score += 2
+
+    # جودة جسم الشمعة
+    if behavior["body_ratio"] >= 0.35:
+        score += 1
+
+    # قوة الإغلاق
+    if direction == "CALL":
+        if behavior["close_position"] >= 0.75:
+            score += 1
+
+    if direction == "PUT":
+        if behavior["close_position"] <= 0.25:
+            score += 1
+
+    # الزخم
+    score += 1
+
+    # RSI مناسب
+    score += 1
+
+    # عدم وجود مقاومة أو دعم قريب يعاكس الدخول
+    score += 1
+
+    if score < MIN_SCORE:
+        return None
+
+    logger.info(
+        "SIGNAL: %s | score=%s | RSI=%.2f | pattern=%s",
+        direction,
+        score,
+        rsi,
+        pattern
+    )
 
     return {
-        "direction": trend,
+        "direction": direction,
         "entry_reference_price": current["close"],
-        "pattern": "Engulfing" if engulfing else "Wick Rejection",
+        "pattern": pattern,
+        "score": score,
+        "rsi": round(rsi, 2),
+        "candle_body_ratio": round(
+            behavior["body_ratio"], 2
+        ),
         "expiry_minutes": 1,
         "status": "DEMO_ONLY"
     }
 
 
-# ذاكرة الإشارات التي سبق إرسالها
+# =====================================
+# منع تكرار الإشارات
+# =====================================
+
 sent_signals = set()
 
 
 def is_new_signal(symbol, signal):
+
     if signal is None:
         return False
 
@@ -164,7 +462,6 @@ def is_new_signal(symbol, signal):
 
     sent_signals.add(key)
 
-    # منع نمو الذاكرة بلا حدود
     if len(sent_signals) > 1000:
         sent_signals.clear()
         sent_signals.add(key)
