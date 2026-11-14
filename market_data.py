@@ -29,7 +29,8 @@ def fetch_candles(symbol="EURUSD_otc", timeframe=60, limit=50):
         f"{API_URL}?{params}",
         headers={
             "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "User-Agent": "OTC-Smart-Analyzer/1.0"
         }
     )
 
@@ -38,8 +39,9 @@ def fetch_candles(symbol="EURUSD_otc", timeframe=60, limit=50):
             data = json.loads(response.read().decode("utf-8"))
 
     except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"OTCharts API error: HTTP {error.code}"
+            f"OTCharts returned HTTP {error.code}: {details[:300]}"
         ) from None
 
     except urllib.error.URLError:
