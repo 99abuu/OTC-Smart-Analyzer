@@ -49,7 +49,8 @@ def format_strategies(signal):
 
 def format_signal_details(signal):
     return (
-        f"📚 الاستراتيجيات المتحققة ({len(signal.get('matching_strategies', []))}):\n"
+        f"📚 الاستراتيجيات المتحققة "
+        f"({len(signal.get('matching_strategies', []))}):\n"
         f"{format_strategies(signal)}"
     )
 
@@ -145,17 +146,17 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📡 تحليل يدوي تجريبي\n\n"
             f"الأداة: {selected}\n"
             f"الاتجاه: {signal['direction']}\n"
-            f"السعر المرجعي: {signal['entry_reference_price']}\n\n"
+            f"السعر المرجعي: {signal['price']}\n\n"
             f"{format_signal_details(signal)}\n\n"
             "⚠️ هذا التحليل ليس إشارة دخول مباشرة."
         )
 
         await update.message.reply_text(message)
 
-    except Exception as error:
+    except Exception:
         logger.exception("Manual analysis failed")
         await update.message.reply_text(
-            f"❌ تعذر التحليل: {str(error)[:300]}"
+            "❌ تعذر التحليل. راجع سجلات التشغيل."
         )
 
 
@@ -163,8 +164,14 @@ async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         symbols = await asyncio.to_thread(fetch_otc_symbols)
 
+        def payout_value(item):
+            try:
+                return float(item.get("payout") or 0)
+            except (TypeError, ValueError):
+                return 0
+
         symbols.sort(
-            key=lambda item: float(item.get("payout") or 0),
+            key=payout_value,
             reverse=True
         )
 
@@ -176,10 +183,10 @@ async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-    except Exception as error:
+    except Exception:
         logger.exception("Symbol list failed")
         await update.message.reply_text(
-            f"❌ خطأ: {str(error)[:300]}"
+            "❌ تعذر جلب قائمة الأدوات. راجع سجلات التشغيل."
         )
 
 
