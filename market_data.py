@@ -8,6 +8,7 @@ import urllib.parse
 
 API_URL = "https://otcharts.com/v1/candles"
 SYMBOLS_URL = "https://otcharts.com/v1/symbols"
+STREAM_URL = "https://otcharts.com/v1/stream"
 
 
 def get_api_key():
@@ -34,9 +35,7 @@ def make_request(url):
             return json.loads(response.read().decode("utf-8"))
 
     except urllib.error.HTTPError as error:
-        details = error.read().decode(
-            "utf-8", errors="replace"
-        )
+        details = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(
             f"OTCharts HTTP {error.code}: {details[:300]}"
         ) from None
@@ -63,15 +62,12 @@ def fetch_candles(
     })
 
     data = make_request(f"{API_URL}?{params}")
-
     candles = data.get("candles", [])
 
     if not candles:
         raise RuntimeError("No candles returned by OTCharts")
 
-    required_fields = (
-        "open", "high", "low", "close"
-    )
+    required_fields = ("open", "high", "low", "close", "time")
 
     for candle in candles:
         if not all(field in candle for field in required_fields):
@@ -104,3 +100,68 @@ def fetch_otc_symbols():
     ]
 
     return available_symbols
+
+
+def stream_ticks(symbols):
+    if not isinstance(symbols, list) or not symbols:
+        raise ValueError("A non-empty symbols list is required")
+
+    if len(symbols) > 5:
+        raise ValueError("Lite supports a maximum of 5 symbols per stream")
+
+    if not all(isinstance(symbol, str) for symbol in symbols):
+        raise ValueError("Every symbol must be a string")
+
+    params = urllib.parse.urlencode({
+        "venue": "otc",
+        "symbol": ",".join(symbols)
+    })
+
+    request = urllib.request.Request(
+        f"{STREAM_URL}?{params}",
+        headers={
+            "Authorization": f"Bearer {get_api_key()}",
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "User-Agent": "OTC-Smart-Analyzer/1.0"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            event_name = "message"
+            data_lines = []
+
+            for raw_line in response:
+                line = raw_line.decode(
+                    "utf-8", errors="replace"
+                ).strip()
+
+                if not line:
+                    if data_lines:
+                        payload = json.loads("\n".join(data_lines))
+                        payload["_event"] = event_name
+                        yield payload
+
+                    event_name = "message"
+                    data_lines = []
+                    continue
+
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:].strip())
+
+    except urllib.error.HTTPError as error:
+        details = error.read().decode(
+            "utf-8", errors="replace"
+        )
+        raise RuntimeError(
+            f"OTCharts stream HTTP {error.code}: {details[:300]}"
+        ) from None
+
+    except urllib.error.URLError:
+        raise RuntimeError(
+            "Could not connect to OTCharts stream"
+        ) from None
