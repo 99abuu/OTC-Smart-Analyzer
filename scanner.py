@@ -5,13 +5,18 @@ import threading
 import queue
 from datetime import datetime, timezone
 
-from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
+from market_data import (
+    fetch_otc_symbols,
+    fetch_candles,
+    stream_ticks
+)
 from signal_engine import analyze_signal, is_new_signal
 
 logger = logging.getLogger(__name__)
 
 MAX_SYMBOLS = 5
 TRADE_DURATION = 60
+PRE_ENTRY_SECONDS = 60
 MAX_CANDLES = 100
 
 
@@ -40,17 +45,14 @@ def stream_worker(symbols, tick_queue, stop_event):
                     except queue.Full:
                         logger.warning("Tick queue is full")
 
-                elif tick.get("_event") in ("closed", "dropped"):
-                    logger.warning("Stream event: %s", tick)
-
             if not received:
-                logger.warning("Stream ended without receiving ticks")
+                logger.warning("Stream ended without ticks")
 
         except Exception:
             logger.exception("Live stream disconnected")
 
         if not stop_event.is_set():
-            logger.info("Reconnecting to live stream in 5 seconds")
+            logger.info("Reconnecting in 5 seconds")
             stop_event.wait(5)
 
 
@@ -62,7 +64,7 @@ def add_candle(candles, candle):
 
 
 async def scanner_loop(send_signal, send_result):
-    logger.info("OTC continuous scanner starting")
+    logger.info("OTC pre-entry scanner starting")
 
     symbols_data = await asyncio.to_thread(fetch_otc_symbols)
 
@@ -111,8 +113,25 @@ async def scanner_loop(send_signal, send_result):
 
     current_1m = {}
     building_5m = {}
+
+    pending_alerts = {}
     pending_trades = {}
-    seen_tick_symbols = set()
+
+    async def notify_cancel(symbol, alert, reason):
+        message = dict(alert["signal"])
+        message.update({
+            "symbol": symbol,
+            "phase": "CANCELLED",
+            "planned_entry_time": format_time(
+                alert["entry_at"]
+            ),
+            "cancel_reason": reason
+        })
+
+        try:
+            await send_signal(message)
+        except Exception:
+            logger.exception("Cancellation notification failed")
 
     async def process_tick(tick):
         symbol = tick.get("symbol")
@@ -129,17 +148,7 @@ async def scanner_loop(send_signal, send_result):
         price = float(price)
         timestamp = float(timestamp)
 
-        if symbol not in seen_tick_symbols:
-            seen_tick_symbols.add(symbol)
-            logger.info(
-                "LIVE PRICE RECEIVED: %s = %s at %s",
-                symbol,
-                price,
-                format_time(timestamp)
-            )
-
-        minute_bucket = int(timestamp // 60)
-
+        # تسوية الصفقات التي أُرسل إشعار دخولها بنجاح فقط
         trade = pending_trades.get(symbol)
 
         if trade and timestamp >= trade["settles_at"]:
@@ -175,8 +184,12 @@ async def scanner_loop(send_signal, send_result):
                 result
             )
 
-            await send_result(result_data)
+            try:
+                await send_result(result_data)
+            except Exception:
+                logger.exception("Result notification failed")
 
+        minute_bucket = int(timestamp // 60)
         previous = current_1m.get(symbol)
 
         if previous is None:
@@ -189,15 +202,16 @@ async def scanner_loop(send_signal, send_result):
             }
             return
 
+        if minute_bucket < previous["bucket"]:
+            return
+
         if minute_bucket == previous["bucket"]:
             previous["high"] = max(previous["high"], price)
             previous["low"] = min(previous["low"], price)
             previous["close"] = price
             return
 
-        if minute_bucket < previous["bucket"]:
-            return
-
+        # إغلاق شمعة الدقيقة السابقة
         if minute_bucket == previous["bucket"] + 1:
             closed_candle = {
                 "open": previous["open"],
@@ -260,48 +274,14 @@ async def scanner_loop(send_signal, send_result):
                     "count": 1
                 }
 
-            if (
-                symbol not in pending_trades
-                and len(candles_1m[symbol]) >= 25
-                and len(candles_5m[symbol]) >= 25
-            ):
-                signal = analyze_signal(
-                    candles_1m[symbol],
-                    candles_5m[symbol]
-                )
-
-                if signal and is_new_signal(symbol, signal):
-                    trade = {
-                        "symbol": symbol,
-                        "direction": signal["direction"],
-                        "entry_price": price,
-                        "entry_time": timestamp,
-                        "settles_at": timestamp + TRADE_DURATION
-                    }
-
-                    pending_trades[symbol] = trade
-
-                    signal["symbol"] = symbol
-                    signal["entry_price"] = price
-                    signal["entry_time"] = format_time(timestamp)
-                    signal["expiry_minutes"] = 1
-
-                    await send_signal(signal)
-
-                    logger.info(
-                        "Trade started: %s %s at %s",
-                        symbol,
-                        signal["direction"],
-                        price
-                    )
-
         else:
             logger.warning(
-                "Missing minute data for %s; resetting 5m builder",
+                "Missing minute data for %s",
                 symbol
             )
             building_5m.pop(symbol, None)
 
+        # تحديث الشمعة الحالية
         current_1m[symbol] = {
             "bucket": minute_bucket,
             "open": price,
@@ -309,6 +289,117 @@ async def scanner_loop(send_signal, send_result):
             "low": price,
             "close": price
         }
+
+        # إعادة فحص الإشارة التي تنتظر موعد الدخول
+        alert = pending_alerts.get(symbol)
+
+        if alert and timestamp >= alert["entry_at"]:
+            del pending_alerts[symbol]
+
+            confirmed = analyze_signal(
+                candles_1m[symbol],
+                candles_5m[symbol]
+            )
+
+            if (
+                confirmed is None
+                or confirmed["direction"] != alert["signal"]["direction"]
+            ):
+                await notify_cancel(
+                    symbol,
+                    alert,
+                    "تغيرت شروط السوق قبل الدخول"
+                )
+                logger.info("Signal cancelled: %s", symbol)
+                return
+
+            entry_message = dict(confirmed)
+            entry_message.update({
+                "symbol": symbol,
+                "phase": "ENTRY",
+                "entry_price": price,
+                "entry_time": format_time(timestamp),
+                "expiry_minutes": 1
+            })
+
+            # لا نسجل الصفقة إلا إذا وصل إشعار الدخول بنجاح
+            try:
+                delivered = await send_signal(entry_message)
+            except Exception:
+                logger.exception("Entry notification failed")
+                delivered = False
+
+            if delivered:
+                pending_trades[symbol] = {
+                    "direction": confirmed["direction"],
+                    "entry_price": price,
+                    "entry_time": timestamp,
+                    "settles_at": timestamp + TRADE_DURATION
+                }
+
+                logger.info(
+                    "Entry notification sent: %s %s",
+                    symbol,
+                    confirmed["direction"]
+                )
+            else:
+                logger.warning(
+                    "Entry not recorded because notification failed: %s",
+                    symbol
+                )
+
+            return
+
+        # لا نفتح تنبيهاً جديداً أثناء وجود تنبيه أو صفقة
+        if (
+            symbol in pending_alerts
+            or symbol in pending_trades
+            or len(candles_1m[symbol]) < 25
+            or len(candles_5m[symbol]) < 25
+        ):
+            return
+
+        signal = analyze_signal(
+            candles_1m[symbol],
+            candles_5m[symbol]
+        )
+
+        if not signal or not is_new_signal(symbol, signal):
+            return
+
+        planned_entry = timestamp + PRE_ENTRY_SECONDS
+
+        pre_alert = dict(signal)
+        pre_alert.update({
+            "symbol": symbol,
+            "phase": "PRE_ALERT",
+            "alert_time": format_time(timestamp),
+            "planned_entry_time": format_time(planned_entry),
+            "seconds_until_entry": PRE_ENTRY_SECONDS
+        })
+
+        try:
+            delivered = await send_signal(pre_alert)
+        except Exception:
+            logger.exception("Pre-entry notification failed")
+            delivered = False
+
+        if delivered:
+            pending_alerts[symbol] = {
+                "signal": signal,
+                "entry_at": planned_entry
+            }
+
+            logger.info(
+                "Pre-entry alert sent: %s %s",
+                symbol,
+                signal["direction"]
+            )
+        else:
+            logger.warning(
+                "Pre-entry alert was not delivered: %s",
+                symbol
+            )
 
     try:
         while True:
