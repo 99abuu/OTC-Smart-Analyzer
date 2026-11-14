@@ -11,6 +11,7 @@ from market_data import (
     fetch_otc_symbols,
     stream_ticks
 )
+from signal_engine import analyze_signal
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -18,9 +19,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 OTC Smart Analyzer\n\n"
         "/start - بدء البوت\n"
         "/status - حالة البوت\n"
-        "/analyze - طلب تحليل\n"
+        "/analyze - تحليل أول أداة متاحة\n"
+        "/analyze #AAPL_otc - تحليل أداة محددة\n"
         "/testdata - اختبار EUR/USD OTC\n"
-        "/testsymbols - اختبار قائمة OTC\n"
+        "/testsymbols - قائمة أدوات OTC\n"
         "/testapple - اختبار Apple OTC\n"
         "/teststream - اختبار البث المباشر"
     )
@@ -29,27 +31,109 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📊 البوت يعمل\n"
-        "📡 البث المباشر: قيد الاختبار\n"
-        "🔍 الإشارات: لم يتم تفعيلها بعد"
+        "📡 اتصال OTCharts: تم اختباره\n"
+        "🔍 محرك التحليل: مفعّل\n"
+        "⚠️ الإشارات تجريبية وليست ضماناً للربح"
     )
+
+
+def run_analysis(symbol=None):
+    available = fetch_otc_symbols()
+
+    if not available:
+        raise RuntimeError("لا توجد أدوات OTC متاحة حالياً")
+
+    if symbol:
+        match = next(
+            (
+                item for item in available
+                if item["symbol"].lower() == symbol.lower()
+            ),
+            None
+        )
+        if match is None:
+            raise RuntimeError(
+                "الأداة غير موجودة في قائمة OTC المتاحة"
+            )
+    else:
+        match = available[0]
+
+    selected_symbol = match["symbol"]
+
+    candles_1m = fetch_candles(
+        symbol=selected_symbol,
+        timeframe=60,
+        limit=50
+    )
+
+    candles_5m = fetch_candles(
+        symbol=selected_symbol,
+        timeframe=300,
+        limit=50
+    )
+
+    signal = analyze_signal(candles_1m, candles_5m)
+
+    return selected_symbol, signal, len(candles_1m), len(candles_5m)
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⏳ نظام الإشارات قيد البناء."
-    )
+    symbol = context.args[0] if context.args else None
 
-
-async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⏳ جاري اختبار EUR/USD OTC..."
+        "🔍 جاري تحليل بيانات OTC...\n"
+        "انتظر قليلاً."
     )
 
     try:
-        candles = fetch_candles(
-            symbol="EURUSD_otc",
-            timeframe=60,
-            limit=5
+        selected, signal, count_1m, count_5m = await asyncio.to_thread(
+            run_analysis,
+            symbol
+        )
+
+        if signal is None:
+            await update.message.reply_text(
+                f"📊 نتيجة التحليل\n\n"
+                f"الأداة: {selected}\n"
+                f"شموع الدقيقة: {count_1m}\n"
+                f"شموع 5 دقائق: {count_5m}\n\n"
+                "لا توجد فرصة مطابقة للشروط حالياً.\n"
+                "لن نصدر إشارة لمجرد إجبار النظام على الدخول."
+            )
+            return
+
+        direction = signal["direction"]
+        emoji = "🟢" if direction == "CALL" else "🔴"
+
+        await update.message.reply_text(
+            f"📡 إشارة تجريبية\n\n"
+            f"الأداة: {selected}\n"
+            f"الاتجاه: {emoji} {direction}\n"
+            f"النمط: {signal['pattern']}\n"
+            f"السعر المرجعي: {signal['entry_reference_price']}\n"
+            f"الإطار المؤكد: 5 دقائق\n"
+            f"إطار الإشارة: دقيقة واحدة\n"
+            f"الانتهاء المقترح: دقيقة واحدة\n\n"
+            "⚠️ هذه نتيجة تحليل أولي وليست توصية مالية.\n"
+            "اختبرها على الحساب التجريبي فقط."
+        )
+
+    except Exception as error:
+        print(f"Analysis failed: {error}")
+        await update.message.reply_text(
+            f"❌ تعذر إكمال التحليل:\n{str(error)[:400]}"
+        )
+
+
+async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ جاري اختبار EUR/USD OTC...")
+
+    try:
+        candles = await asyncio.to_thread(
+            fetch_candles,
+            "EURUSD_otc",
+            60,
+            5
         )
 
         latest = candles[-1]
@@ -71,12 +155,10 @@ async def testdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⏳ جاري جلب قائمة OTC..."
-    )
+    await update.message.reply_text("⏳ جاري جلب قائمة OTC...")
 
     try:
-        symbols = fetch_otc_symbols()
+        symbols = await asyncio.to_thread(fetch_otc_symbols)
 
         await update.message.reply_text(
             f"✅ نجح الاتصال!\n"
@@ -96,15 +178,14 @@ async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def testapple(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⏳ جاري اختبار Apple OTC..."
-    )
+    await update.message.reply_text("⏳ جاري اختبار Apple OTC...")
 
     try:
-        candles = fetch_candles(
-            symbol="#AAPL_otc",
-            timeframe=60,
-            limit=5
+        candles = await asyncio.to_thread(
+            fetch_candles,
+            "#AAPL_otc",
+            60,
+            5
         )
 
         latest = candles[-1]
@@ -132,7 +213,6 @@ def read_first_tick(symbols):
         for event in stream:
             if event.get("_event") == "tick":
                 return event
-
     finally:
         stream.close()
 
@@ -142,11 +222,11 @@ def read_first_tick(symbols):
 async def teststream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⏳ جاري اختبار البث المباشر...\n"
-        "تم تحديد خمس أدوات، وننتظر أول تحديث سعر."
+        "ننتظر أول تحديث سعر."
     )
 
     try:
-        available = fetch_otc_symbols()
+        available = await asyncio.to_thread(fetch_otc_symbols)
 
         selected = [
             item["symbol"]
@@ -165,16 +245,14 @@ async def teststream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise RuntimeError("No tick event received")
 
         await update.message.reply_text(
-            "✅ وصل أول تحديث سعر مباشر!\n\n"
+            "✅ وصل تحديث سعر مباشر!\n\n"
             f"الأدوات: {', '.join(selected)}\n\n"
-            "بيانات التحديث:\n"
             + json.dumps(event, ensure_ascii=False)[:2500]
         )
 
     except asyncio.TimeoutError:
         await update.message.reply_text(
-            "⚠️ لم يصل تحديث سعر خلال 60 ثانية.\n"
-            "هذا لا يعني أن الاتصال فشل، لكنه يعني أننا لم نتحقق من وصول tick بعد."
+            "⚠️ لم يصل تحديث سعر خلال 60 ثانية."
         )
 
     except Exception as error:
