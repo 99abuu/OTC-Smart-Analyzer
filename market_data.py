@@ -35,7 +35,9 @@ def make_request(url):
             return json.loads(response.read().decode("utf-8"))
 
     except urllib.error.HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
+        details = error.read().decode(
+            "utf-8", errors="replace"
+        )
         raise RuntimeError(
             f"OTCharts HTTP {error.code}: {details[:300]}"
         ) from None
@@ -67,7 +69,7 @@ def fetch_candles(
     if not candles:
         raise RuntimeError("No candles returned by OTCharts")
 
-    required_fields = ("open", "high", "low", "close", "time")
+    required_fields = ("open", "high", "low", "close")
 
     for candle in candles:
         if not all(field in candle for field in required_fields):
@@ -107,7 +109,7 @@ def stream_ticks(symbols):
         raise ValueError("A non-empty symbols list is required")
 
     if len(symbols) > 5:
-        raise ValueError("Lite supports a maximum of 5 symbols per stream")
+        raise ValueError("Maximum 5 symbols per stream")
 
     if not all(isinstance(symbol, str) for symbol in symbols):
         raise ValueError("Every symbol must be a string")
