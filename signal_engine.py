@@ -8,8 +8,8 @@ def ema(values, period):
 
     for value in values[period:]:
         result = (
-            (value * multiplier)
-            + (result * (1 - multiplier))
+            value * multiplier
+            + result * (1 - multiplier)
         )
 
     return result
@@ -90,8 +90,6 @@ def analyze_signal(candles_1m, candles_5m):
         ):
             return None
 
-    # يجب تمرير الشموع المغلقة فقط إلى المحرك.
-    closes_1m = [c["close"] for c in candles_1m]
     closes_5m = [c["close"] for c in candles_5m]
 
     fast_5m = ema(closes_5m, 9)
@@ -110,53 +108,65 @@ def analyze_signal(candles_1m, candles_5m):
     previous = candles_1m[-2]
     current = candles_1m[-1]
 
-    direction = candle_direction(current)
-
-    if direction != trend:
+    if candle_direction(current) != trend:
         return None
 
     if trend == "CALL":
-        pattern = (
-            bullish_engulfing(previous, current)
-            or bullish_rejection(current)
-        )
+        engulfing = bullish_engulfing(previous, current)
+        rejection = bullish_rejection(current)
     else:
-        pattern = (
-            bearish_engulfing(previous, current)
-            or bearish_rejection(current)
-        )
+        engulfing = bearish_engulfing(previous, current)
+        rejection = bearish_rejection(current)
 
-    if not pattern:
+    if not engulfing and not rejection:
         return None
 
-    # فلتر بسيط لتجنب الدخول بعد حركة دقيقة كبيرة جداً.
     recent_ranges = [
         c["high"] - c["low"]
         for c in candles_1m[-11:-1]
     ]
 
     average_range = sum(recent_ranges) / len(recent_ranges)
-
     current_range = current["high"] - current["low"]
 
-    if average_range <= 0 or current_range > average_range * 2.5:
+    if average_range <= 0:
+        return None
+
+    if current_range > average_range * 2.5:
         return None
 
     return {
         "direction": trend,
-        "symbol": None,
-        "entry": "Next 1-minute candle",
-        "expiry_minutes": 1,
         "entry_reference_price": current["close"],
-        "trend_timeframe": "5m",
-        "confirmation_timeframe": "1m",
-        "pattern": (
-            "Engulfing"
-            if (
-                bullish_engulfing(previous, current)
-                or bearish_engulfing(previous, current)
-            )
-            else "Wick Rejection"
-        ),
+        "pattern": "Engulfing" if engulfing else "Wick Rejection",
+        "expiry_minutes": 1,
         "status": "DEMO_ONLY"
     }
+
+
+# ذاكرة الإشارات التي سبق إرسالها
+sent_signals = set()
+
+
+def is_new_signal(symbol, signal):
+    if signal is None:
+        return False
+
+    key = (
+        symbol,
+        signal["direction"],
+        signal["pattern"],
+        signal["entry_reference_price"]
+    )
+
+    if key in sent_signals:
+        return False
+
+    sent_signals.add(key)
+
+    # منع نمو الذاكرة بلا حدود
+    if len(sent_signals) > 1000:
+        sent_signals.clear()
+        sent_signals.add(key)
+
+    return True
