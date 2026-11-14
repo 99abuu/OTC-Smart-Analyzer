@@ -52,8 +52,9 @@ def ema(values, period):
     current = sum(values[:period]) / period
 
     for value in values[period:]:
-        current = (value * multiplier) + (
-            current * (1 - multiplier)
+        current = (
+            value * multiplier
+            + current * (1 - multiplier)
         )
 
     return current
@@ -75,6 +76,7 @@ def rsi(values, period=14):
         return 100 if gains > 0 else 50
 
     rs = gains / losses
+
     return 100 - (100 / (1 + rs))
 
 
@@ -162,7 +164,12 @@ def find_support_resistance(candles, lookback=30):
     return support, resistance
 
 
-def strategy_support_rejection(candles, support, resistance, average_atr):
+def strategy_support_rejection(
+    candles,
+    support,
+    resistance,
+    average_atr
+):
     if support is None or average_atr is None:
         return None
 
@@ -173,6 +180,7 @@ def strategy_support_rejection(candles, support, resistance, average_atr):
         return None
 
     distance = abs(candle["low"] - support)
+
     near_level = distance <= max(
         average_atr * 0.25,
         candle["close"] * 0.0005
@@ -187,13 +195,18 @@ def strategy_support_rejection(candles, support, resistance, average_atr):
     if near_level and bullish_rejection:
         return (
             "CALL",
-            "Support Rejection: ارتداد مؤكد نسبياً من الدعم"
+            "Support Rejection: ارتداد من الدعم"
         )
 
     return None
 
 
-def strategy_resistance_rejection(candles, support, resistance, average_atr):
+def strategy_resistance_rejection(
+    candles,
+    support,
+    resistance,
+    average_atr
+):
     if resistance is None or average_atr is None:
         return None
 
@@ -204,6 +217,7 @@ def strategy_resistance_rejection(candles, support, resistance, average_atr):
         return None
 
     distance = abs(candle["high"] - resistance)
+
     near_level = distance <= max(
         average_atr * 0.25,
         candle["close"] * 0.0005
@@ -224,16 +238,14 @@ def strategy_resistance_rejection(candles, support, resistance, average_atr):
     return None
 
 
-def strategy_trend_pullback(candles_1m, candles_5m, trend_1m, trend_5m):
-    if trend_1m not in ("UP", "DOWN"):
+def strategy_trend_pullback(candles, trend):
+    if trend not in ("UP", "DOWN"):
         return None
 
-    if trend_5m != trend_1m:
-        return None
+    closes = [c["close"] for c in candles]
 
-    closes = [c["close"] for c in candles_1m]
-    current = candles_1m[-1]
-    previous = candles_1m[-2]
+    current = candles[-1]
+    previous = candles[-2]
 
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
@@ -247,7 +259,8 @@ def strategy_trend_pullback(candles_1m, candles_5m, trend_1m, trend_5m):
     if not metrics or metrics["body_ratio"] < 0.35:
         return None
 
-    if trend_1m == "UP":
+    if trend == "UP":
+
         pullback = (
             previous["low"] <= ema20 * 1.0015
             or previous["low"] <= ema50 * 1.0015
@@ -266,7 +279,8 @@ def strategy_trend_pullback(candles_1m, candles_5m, trend_1m, trend_5m):
                 "Trend Pullback: تصحيح ثم استئناف الاتجاه الصاعد"
             )
 
-    if trend_1m == "DOWN":
+    if trend == "DOWN":
+
         pullback = (
             previous["high"] >= ema20 * 0.9985
             or previous["high"] >= ema50 * 0.9985
@@ -334,27 +348,25 @@ def strategy_breakout_retest(candles, average_atr):
     return None
 
 
-def analyze_signal(candles_1m, candles_5m, symbol=None):
-    candles_1m = valid_candles(candles_1m)
-    candles_5m = valid_candles(candles_5m)
+def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
-    if len(candles_1m) < MIN_CANDLES:
+    # جميع الحسابات والاستراتيجيات تعتمد على الدقيقة فقط.
+    # candles_5m موجود مؤقتاً للتوافق مع استدعاءات النسخة القديمة.
+    candles = valid_candles(candles_1m)
+
+    if len(candles) < MIN_CANDLES:
         return None
 
-    if len(candles_5m) < 50:
-        return None
+    closes = [c["close"] for c in candles]
 
-    closes_1m = [c["close"] for c in candles_1m]
-
-    current = candles_1m[-1]
+    current = candles[-1]
     price = current["close"]
 
-    average_atr = atr(candles_1m)
+    average_atr = atr(candles)
 
     if average_atr is None or average_atr <= 0:
         return None
 
-    # تجاهل الحركة الضعيفة جداً أو الشمعة غير الطبيعية
     current_metrics = candle_metrics(current)
 
     if not current_metrics:
@@ -366,25 +378,33 @@ def analyze_signal(candles_1m, candles_5m, symbol=None):
     if current_metrics["range"] > average_atr * 3.0:
         return None
 
-    trend_1m, ema20_1m, ema50_1m, ema200_1m = get_trend(candles_1m)
-    trend_5m, ema20_5m, ema50_5m, ema200_5m = get_trend(candles_5m)
+    # اتجاه السوق على الدقيقة فقط
+    trend, ema20, ema50, ema200 = get_trend(candles)
 
-    current_rsi = rsi(closes_1m)
+    current_rsi = rsi(closes)
 
-    support, resistance = find_support_resistance(candles_1m)
+    support, resistance = find_support_resistance(candles)
 
     strategies = [
         strategy_support_rejection(
-            candles_1m, support, resistance, average_atr
+            candles,
+            support,
+            resistance,
+            average_atr
         ),
         strategy_resistance_rejection(
-            candles_1m, support, resistance, average_atr
+            candles,
+            support,
+            resistance,
+            average_atr
         ),
         strategy_trend_pullback(
-            candles_1m, candles_5m, trend_1m, trend_5m
+            candles,
+            trend
         ),
         strategy_breakout_retest(
-            candles_1m, average_atr
+            candles,
+            average_atr
         )
     ]
 
@@ -392,6 +412,7 @@ def analyze_signal(candles_1m, candles_5m, symbol=None):
     puts = []
 
     for result in strategies:
+
         if result is None:
             continue
 
@@ -399,17 +420,20 @@ def analyze_signal(candles_1m, candles_5m, symbol=None):
 
         if direction == "CALL":
             calls.append((reason, direction))
+
         elif direction == "PUT":
             puts.append((reason, direction))
 
-    # لا نرسل إشارات متضاربة
+    # منع الإشارات المتضاربة
     if calls and puts:
+
         logger.info(
             "Signal conflict | symbol=%s | CALL=%s | PUT=%s",
             symbol,
             len(calls),
             len(puts)
         )
+
         return None
 
     selected = calls if calls else puts
@@ -419,11 +443,17 @@ def analyze_signal(candles_1m, candles_5m, symbol=None):
 
     direction = selected[0][1]
 
-    matching_strategies = [item[0].split(":")[0] for item in selected]
-    strategy_reasons = [item[0] for item in selected]
+    matching_strategies = [
+        item[0].split(":")[0]
+        for item in selected
+    ]
 
-    # تقييم وصفي للنقاط، وليس احتمال نجاح
-    score = min(100, 70 + (len(selected) * 7))
+    strategy_reasons = [
+        item[0]
+        for item in selected
+    ]
+
+    score = min(100, 70 + len(selected) * 7)
 
     return {
         "symbol": symbol,
@@ -444,9 +474,10 @@ def analyze_signal(candles_1m, candles_5m, symbol=None):
         "strategy_reasons": strategy_reasons,
         "support": support,
         "resistance": resistance,
-        "trend": trend_1m,
-        "trend_5m": trend_5m,
-        "ema200": ema200_1m
+        "trend": trend,
+        "trend_5m": "NOT_USED",
+        "ema200": ema200,
+        "analysis_timeframe": "1m"
     }
 
 
@@ -454,6 +485,7 @@ _sent = set()
 
 
 def is_new_signal(signal):
+
     if not signal:
         return False
 
