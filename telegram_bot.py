@@ -20,6 +20,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
+# إخفاء سجلات طلبات HTTP التي قد تكشف رمز البوت
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
