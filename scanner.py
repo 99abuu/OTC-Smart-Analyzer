@@ -13,31 +13,15 @@ from signal_engine import analyze_signal, is_new_signal
 logger = logging.getLogger(__name__)
 
 MAX_SYMBOLS = 5
-SCAN_INTERVAL = 180
 TRADE_DURATION = 60
-TICK_MAX_AGE = 10
+MAX_CANDLES = 100
 
 
-def scan_symbol(symbol):
-    candles_1m = fetch_candles(
-        symbol=symbol,
-        timeframe=60,
-        limit=50
-    )
-
-    candles_5m = fetch_candles(
-        symbol=symbol,
-        timeframe=300,
-        limit=50
-    )
-
-    signal = analyze_signal(candles_1m, candles_5m)
-
-    if signal and is_new_signal(symbol, signal):
-        signal["symbol"] = symbol
-        return signal
-
-    return None
+def format_time(timestamp):
+    return datetime.fromtimestamp(
+        timestamp,
+        timezone.utc
+    ).strftime("%H:%M:%S UTC")
 
 
 def stream_worker(symbols, tick_queue, stop_event):
@@ -51,7 +35,7 @@ def stream_worker(symbols, tick_queue, stop_event):
 
                 if tick.get("_event") == "tick":
                     try:
-                        tick_queue.put(tick, timeout=5)
+                        tick_queue.put(tick, timeout=2)
                     except queue.Full:
                         logger.warning("Tick queue is full")
 
@@ -65,15 +49,15 @@ def stream_worker(symbols, tick_queue, stop_event):
             stop_event.wait(5)
 
 
-def format_time(timestamp):
-    return datetime.fromtimestamp(
-        timestamp,
-        timezone.utc
-    ).strftime("%H:%M:%S UTC")
+def add_candle(candles, candle):
+    candles.append(candle)
+
+    if len(candles) > MAX_CANDLES:
+        del candles[:-MAX_CANDLES]
 
 
 async def scanner_loop(send_signal, send_result):
-    logger.info("OTC scanner started")
+    logger.info("OTC continuous scanner starting")
 
     symbols_data = await asyncio.to_thread(fetch_otc_symbols)
 
@@ -91,6 +75,23 @@ async def scanner_loop(send_signal, send_result):
 
     logger.info("Monitoring: %s", symbols)
 
+    candles_1m = {}
+    candles_5m = {}
+
+    # تحميل التاريخ مرة واحدة عند التشغيل
+    for symbol in symbols:
+        history_1m, history_5m = await asyncio.gather(
+            asyncio.to_thread(
+                fetch_candles, symbol, 60, 50
+            ),
+            asyncio.to_thread(
+                fetch_candles, symbol, 300, 50
+            )
+        )
+
+        candles_1m[symbol] = list(history_1m)
+        candles_5m[symbol] = list(history_5m)
+
     tick_queue = queue.Queue(maxsize=5000)
     stop_event = threading.Event()
 
@@ -99,110 +100,175 @@ async def scanner_loop(send_signal, send_result):
         args=(symbols, tick_queue, stop_event),
         daemon=True
     )
+
     worker.start()
 
-    latest_ticks = {}
+    current_1m = {}
+    building_5m = {}
     pending_trades = {}
 
-    async def process_ticks():
-        while True:
-            tick = await asyncio.to_thread(tick_queue.get)
+    async def process_tick(tick):
+        symbol = tick.get("symbol")
+        price = tick.get("price")
+        timestamp = tick.get("time")
 
-            symbol = tick.get("symbol")
-            price = tick.get("price")
-            timestamp = tick.get("time")
+        if (
+            symbol not in symbols
+            or not isinstance(price, (int, float))
+            or not isinstance(timestamp, (int, float))
+        ):
+            return
 
-            if (
-                symbol not in symbols
-                or not isinstance(price, (int, float))
-                or not isinstance(timestamp, (int, float))
+        price = float(price)
+        timestamp = float(timestamp)
+
+        minute_bucket = int(timestamp // 60)
+
+        # متابعة نتيجة الصفقة المفتوحة
+        trade = pending_trades.get(symbol)
+
+        if trade and timestamp >= trade["settles_at"]:
+            entry = trade["entry_price"]
+            direction = trade["direction"]
+
+            if price == entry:
+                result = "DRAW"
+            elif (
+                direction == "CALL" and price > entry
+            ) or (
+                direction == "PUT" and price < entry
             ):
-                continue
+                result = "WIN"
+            else:
+                result = "LOSS"
 
-            latest_ticks[symbol] = {
-                "price": float(price),
-                "time": float(timestamp),
-                "received": time.monotonic()
+            result_data = {
+                "symbol": symbol,
+                "direction": direction,
+                "entry_price": entry,
+                "exit_price": price,
+                "entry_time": trade["entry_time"],
+                "exit_time": timestamp,
+                "result": result
             }
 
-            trade = pending_trades.get(symbol)
+            del pending_trades[symbol]
 
-            if trade and timestamp >= trade["settles_at"]:
-                entry = trade["entry_price"]
-                exit_price = float(price)
-                direction = trade["direction"]
+            await send_result(result_data)
 
-                if exit_price == entry:
-                    result = "DRAW"
-                elif (
-                    direction == "CALL" and exit_price > entry
-                ) or (
-                    direction == "PUT" and exit_price < entry
-                ):
-                    result = "WIN"
-                else:
-                    result = "LOSS"
+        previous = current_1m.get(symbol)
 
-                result_data = {
-                    "symbol": symbol,
-                    "direction": direction,
-                    "entry_price": entry,
-                    "exit_price": exit_price,
-                    "entry_time": trade["entry_time"],
-                    "exit_time": float(timestamp),
-                    "result": result
+        # أول تحديث لهذا الرمز
+        if previous is None:
+            current_1m[symbol] = {
+                "bucket": minute_bucket,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price
+            }
+            return
+
+        # تحديث شمعة الدقيقة الحالية
+        if minute_bucket == previous["bucket"]:
+            previous["high"] = max(previous["high"], price)
+            previous["low"] = min(previous["low"], price)
+            previous["close"] = price
+            return
+
+        # تجاهل التحديثات القديمة
+        if minute_bucket < previous["bucket"]:
+            return
+
+        # إغلاق الشمعة السابقة فقط إذا لم توجد فجوة
+        if minute_bucket == previous["bucket"] + 1:
+            closed_candle = {
+                "open": previous["open"],
+                "high": previous["high"],
+                "low": previous["low"],
+                "close": previous["close"]
+            }
+
+            add_candle(
+                candles_1m[symbol],
+                closed_candle
+            )
+
+            # بناء شموع 5 دقائق من شموع الدقيقة المغلقة
+            five_bucket = previous["bucket"] // 5
+            builder = building_5m.get(symbol)
+
+            if builder is None:
+                building_5m[symbol] = {
+                    "bucket": five_bucket,
+                    "open": closed_candle["open"],
+                    "high": closed_candle["high"],
+                    "low": closed_candle["low"],
+                    "close": closed_candle["close"],
+                    "count": 1
                 }
 
-                del pending_trades[symbol]
+            elif five_bucket == builder["bucket"]:
+                builder["high"] = max(
+                    builder["high"],
+                    closed_candle["high"]
+                )
+                builder["low"] = min(
+                    builder["low"],
+                    closed_candle["low"]
+                )
+                builder["close"] = closed_candle["close"]
+                builder["count"] += 1
 
-                await send_result(result_data)
-
-    tick_task = asyncio.create_task(process_ticks())
-
-    try:
-        while True:
-            try:
-                for item in selected:
-                    symbol = item["symbol"]
-
-                    if symbol in pending_trades:
-                        continue
-
-                    signal = await asyncio.to_thread(
-                        scan_symbol,
-                        symbol
+            else:
+                if (
+                    five_bucket == builder["bucket"] + 1
+                    and builder["count"] == 5
+                ):
+                    add_candle(
+                        candles_5m[symbol],
+                        {
+                            "open": builder["open"],
+                            "high": builder["high"],
+                            "low": builder["low"],
+                            "close": builder["close"]
+                        }
                     )
 
-                    if not signal:
-                        continue
+                building_5m[symbol] = {
+                    "bucket": five_bucket,
+                    "open": closed_candle["open"],
+                    "high": closed_candle["high"],
+                    "low": closed_candle["low"],
+                    "close": closed_candle["close"],
+                    "count": 1
+                }
 
-                    tick = latest_ticks.get(symbol)
+            # لا نفتح صفقة جديدة إذا كانت هناك صفقة معلقة
+            if (
+                symbol not in pending_trades
+                and len(candles_1m[symbol]) >= 25
+                and len(candles_5m[symbol]) >= 25
+            ):
+                signal = analyze_signal(
+                    candles_1m[symbol],
+                    candles_5m[symbol]
+                )
 
-                    if (
-                        not tick
-                        or time.monotonic() - tick["received"] > TICK_MAX_AGE
-                    ):
-                        logger.warning(
-                            "Skipped stale signal for %s",
-                            symbol
-                        )
-                        continue
-
-                    entry_price = tick["price"]
-                    entry_time = tick["time"]
-
+                if signal and is_new_signal(symbol, signal):
                     trade = {
                         "symbol": symbol,
                         "direction": signal["direction"],
-                        "entry_price": entry_price,
-                        "entry_time": entry_time,
-                        "settles_at": entry_time + TRADE_DURATION
+                        "entry_price": price,
+                        "entry_time": timestamp,
+                        "settles_at": timestamp + TRADE_DURATION
                     }
 
                     pending_trades[symbol] = trade
 
-                    signal["entry_price"] = entry_price
-                    signal["entry_time"] = format_time(entry_time)
+                    signal["symbol"] = symbol
+                    signal["entry_price"] = price
+                    signal["entry_time"] = format_time(timestamp)
                     signal["expiry_minutes"] = 1
 
                     await send_signal(signal)
@@ -211,19 +277,43 @@ async def scanner_loop(send_signal, send_result):
                         "Trade started: %s %s at %s",
                         symbol,
                         signal["direction"],
-                        entry_price
+                        price
                     )
 
-            except Exception:
-                logger.exception("Scanner cycle failed")
+        else:
+            logger.warning(
+                "Missing minute data for %s; resetting candle builder",
+                symbol
+            )
 
-            await asyncio.sleep(SCAN_INTERVAL)
+            building_5m.pop(symbol, None)
+
+        # بدء شمعة الدقيقة الجديدة
+        current_1m[symbol] = {
+            "bucket": minute_bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price
+        }
+
+    try:
+        while True:
+            try:
+                tick = await asyncio.to_thread(
+                    tick_queue.get,
+                    True,
+                    1
+                )
+
+                await process_tick(tick)
+
+            except queue.Empty:
+                continue
+
+            except Exception:
+                logger.exception("Tick processing failed")
 
     finally:
         stop_event.set()
-        tick_task.cancel()
-
-        try:
-            await tick_task
-        except asyncio.CancelledError:
-            pass
+        logger.info("OTC scanner stopped")
