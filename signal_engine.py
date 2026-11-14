@@ -5,36 +5,43 @@ from math import isfinite
 logger = logging.getLogger(__name__)
 
 MIN_CANDLES = 60
-MIN_SCORE = 1
-
-_sent = set()
+SIGNAL_COOLDOWN_SECONDS = 3000
 
 
 def valid_candles(candles):
     if not isinstance(candles, list):
-        return False
+        return []
 
-    if len(candles) < MIN_CANDLES:
-        return False
+    result = []
 
     for candle in candles:
-        try:
-            values = [
-                float(candle["open"]),
-                float(candle["high"]),
-                float(candle["low"]),
-                float(candle["close"]),
-            ]
-            if not all(isfinite(v) for v in values):
-                return False
-            if values[2] > values[1] or values[2] > values[0]:
-                return False
-            if values[1] < values[0] or values[1] < values[3]:
-                return False
-        except (KeyError, TypeError, ValueError):
-            return False
+        if not isinstance(candle, dict):
+            continue
 
-    return True
+        try:
+            o = float(candle["open"])
+            h = float(candle["high"])
+            l = float(candle["low"])
+            c = float(candle["close"])
+
+            if not all(isfinite(x) for x in (o, h, l, c)):
+                continue
+
+            if h < max(o, c, l) or l > min(o, c, h):
+                continue
+
+            result.append({
+                **candle,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c
+            })
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return result
 
 
 def ema(values, period):
@@ -42,12 +49,14 @@ def ema(values, period):
         return None
 
     multiplier = 2 / (period + 1)
-    result = sum(values[:period]) / period
+    current = sum(values[:period]) / period
 
     for value in values[period:]:
-        result = (value - result) * multiplier + result
+        current = (value * multiplier) + (
+            current * (1 - multiplier)
+        )
 
-    return result
+    return current
 
 
 def rsi(values, period=14):
@@ -63,307 +72,396 @@ def rsi(values, period=14):
     losses = sum(max(-change, 0) for change in changes) / period
 
     if losses == 0:
-        return 100.0
+        return 100 if gains > 0 else 50
 
-    return 100 - (100 / (1 + gains / losses))
-
-
-def candle_direction(candle):
-    if candle["close"] > candle["open"]:
-        return "CALL"
-    if candle["close"] < candle["open"]:
-        return "PUT"
-    return None
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
 
 
-def add_signal(signals, direction, name, reason):
-    if direction not in ("CALL", "PUT"):
-        return
-
-    signals.append({
-        "direction": direction,
-        "name": name,
-        "reason": reason,
-    })
-
-
-def analyze_signal(candles_1m, candles_5m, symbol=None):
-    if not valid_candles(candles_1m):
+def atr(candles, period=14):
+    if len(candles) < period + 1:
         return None
 
-    if not valid_candles(candles_5m):
+    ranges = []
+
+    for i in range(len(candles) - period, len(candles)):
+        current = candles[i]
+        previous_close = candles[i - 1]["close"]
+
+        true_range = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous_close),
+            abs(current["low"] - previous_close)
+        )
+
+        ranges.append(true_range)
+
+    return sum(ranges) / len(ranges)
+
+
+def candle_metrics(candle):
+    o = candle["open"]
+    h = candle["high"]
+    l = candle["low"]
+    c = candle["close"]
+
+    full_range = h - l
+
+    if full_range <= 0:
         return None
 
-    closes = [float(c["close"]) for c in candles_1m]
-    opens = [float(c["open"]) for c in candles_1m]
-    highs = [float(c["high"]) for c in candles_1m]
-    lows = [float(c["low"]) for c in candles_1m]
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
 
-    closes5 = [float(c["close"]) for c in candles_5m]
+    return {
+        "body": body,
+        "range": full_range,
+        "body_ratio": body / full_range,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "close_position": (c - l) / full_range
+    }
 
-    price = closes[-1]
-    previous_price = closes[-2]
 
-    current = candles_1m[-1]
-    previous = candles_1m[-2]
+def get_trend(candles):
+    closes = [c["close"] for c in candles]
 
-    signals = []
-
-    # 1. EMA 50 / 200
+    ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
     ema200 = ema(closes, 200)
 
-    if ema50 is not None and ema200 is not None:
-        if ema50 > ema200 and price > ema50:
-            add_signal(
-                signals, "CALL", "EMA 50/200",
-                "السعر فوق EMA50 وEMA50 فوق EMA200"
-            )
-        elif ema50 < ema200 and price < ema50:
-            add_signal(
-                signals, "PUT", "EMA 50/200",
-                "السعر تحت EMA50 وEMA50 تحت EMA200"
-            )
+    if ema20 is None or ema50 is None:
+        return "UNKNOWN", ema20, ema50, ema200
 
-    # 2. RSI
+    if ema200 is not None:
+        if ema50 > ema200 and ema20 > ema50:
+            return "UP", ema20, ema50, ema200
+
+        if ema50 < ema200 and ema20 < ema50:
+            return "DOWN", ema20, ema50, ema200
+
+    if ema20 > ema50:
+        return "UP", ema20, ema50, ema200
+
+    if ema20 < ema50:
+        return "DOWN", ema20, ema50, ema200
+
+    return "SIDEWAYS", ema20, ema50, ema200
+
+
+def find_support_resistance(candles, lookback=30):
+    history = candles[-(lookback + 1):-1]
+
+    if len(history) < 15:
+        return None, None
+
+    support = min(c["low"] for c in history)
+    resistance = max(c["high"] for c in history)
+
+    return support, resistance
+
+
+def strategy_support_rejection(candles, support, resistance, average_atr):
+    if support is None or average_atr is None:
+        return None
+
+    candle = candles[-1]
+    metrics = candle_metrics(candle)
+
+    if not metrics:
+        return None
+
+    distance = abs(candle["low"] - support)
+    near_level = distance <= max(
+        average_atr * 0.25,
+        candle["close"] * 0.0005
+    )
+
+    bullish_rejection = (
+        candle["close"] > candle["open"]
+        and metrics["lower_wick"] >= metrics["body"] * 1.2
+        and metrics["close_position"] >= 0.65
+    )
+
+    if near_level and bullish_rejection:
+        return (
+            "CALL",
+            "Support Rejection: ارتداد مؤكد نسبياً من الدعم"
+        )
+
+    return None
+
+
+def strategy_resistance_rejection(candles, support, resistance, average_atr):
+    if resistance is None or average_atr is None:
+        return None
+
+    candle = candles[-1]
+    metrics = candle_metrics(candle)
+
+    if not metrics:
+        return None
+
+    distance = abs(candle["high"] - resistance)
+    near_level = distance <= max(
+        average_atr * 0.25,
+        candle["close"] * 0.0005
+    )
+
+    bearish_rejection = (
+        candle["close"] < candle["open"]
+        and metrics["upper_wick"] >= metrics["body"] * 1.2
+        and metrics["close_position"] <= 0.35
+    )
+
+    if near_level and bearish_rejection:
+        return (
+            "PUT",
+            "Resistance Rejection: رفض سعري عند المقاومة"
+        )
+
+    return None
+
+
+def strategy_trend_pullback(candles_1m, candles_5m, trend_1m, trend_5m):
+    if trend_1m not in ("UP", "DOWN"):
+        return None
+
+    if trend_5m != trend_1m:
+        return None
+
+    closes = [c["close"] for c in candles_1m]
+    current = candles_1m[-1]
+    previous = candles_1m[-2]
+
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
     current_rsi = rsi(closes)
 
-    if current_rsi is not None:
-        if current_rsi <= 25:
-            add_signal(
-                signals, "CALL", "RSI Oversold",
-                f"RSI وصل إلى {current_rsi:.1f} في منطقة تشبع البيع"
-            )
-        elif current_rsi >= 75:
-            add_signal(
-                signals, "PUT", "RSI Overbought",
-                f"RSI وصل إلى {current_rsi:.1f} في منطقة تشبع الشراء"
-            )
-
-    # 3. Support rejection
-    support = min(lows[-21:-1])
-    resistance = max(highs[-21:-1])
-
-    average_range = sum(
-        highs[i] - lows[i] for i in range(-15, 0)
-    ) / 15
-
-    tolerance = max(average_range * 0.20, price * 0.00005)
-
-    if (
-        current["low"] <= support + tolerance
-        and current["close"] > current["open"]
-        and current["close"] > support
-    ):
-        add_signal(
-            signals, "CALL", "Support Rejection",
-            "ارتداد صاعد من منطقة الدعم"
-        )
-
-    # 4. Resistance rejection
-    if (
-        current["high"] >= resistance - tolerance
-        and current["close"] < current["open"]
-        and current["close"] < resistance
-    ):
-        add_signal(
-            signals, "PUT", "Resistance Rejection",
-            "رفض هابط من منطقة المقاومة"
-        )
-
-    # 5. Resistance breakout
-    if previous_price <= resistance and price > resistance:
-        add_signal(
-            signals, "CALL", "Resistance Breakout",
-            "إغلاق فوق المقاومة السابقة"
-        )
-
-    # 6. Support breakdown
-    if previous_price >= support and price < support:
-        add_signal(
-            signals, "PUT", "Support Breakdown",
-            "إغلاق تحت الدعم السابق"
-        )
-
-    # 7. Bullish engulfing
-    if (
-        previous["close"] < previous["open"]
-        and current["close"] > current["open"]
-        and current["open"] <= previous["close"]
-        and current["close"] >= previous["open"]
-    ):
-        add_signal(
-            signals, "CALL", "Bullish Engulfing",
-            "نموذج ابتلاع شرائي"
-        )
-
-    # 8. Bearish engulfing
-    if (
-        previous["close"] > previous["open"]
-        and current["close"] < current["open"]
-        and current["open"] >= previous["close"]
-        and current["close"] <= previous["open"]
-    ):
-        add_signal(
-            signals, "PUT", "Bearish Engulfing",
-            "نموذج ابتلاع بيعي"
-        )
-
-    # 9. Momentum
-    if len(closes) >= 6:
-        momentum = price - closes[-6]
-
-        if momentum > average_range * 1.5:
-            add_signal(
-                signals, "CALL", "Price Momentum",
-                "زخم سعري صاعد خلال آخر 5 شموع"
-            )
-        elif momentum < -average_range * 1.5:
-            add_signal(
-                signals, "PUT", "Price Momentum",
-                "زخم سعري هابط خلال آخر 5 شموع"
-            )
-
-    # 10. EMA 9 / 21 crossover
-    ema9_now = ema(closes, 9)
-    ema21_now = ema(closes, 21)
-    ema9_prev = ema(closes[:-1], 9)
-    ema21_prev = ema(closes[:-1], 21)
-
-    if all(v is not None for v in (
-        ema9_now, ema21_now, ema9_prev, ema21_prev
-    )):
-        if ema9_prev <= ema21_prev and ema9_now > ema21_now:
-            add_signal(
-                signals, "CALL", "EMA 9/21 Cross",
-                "تقاطع EMA9 أعلى EMA21"
-            )
-        elif ema9_prev >= ema21_prev and ema9_now < ema21_now:
-            add_signal(
-                signals, "PUT", "EMA 9/21 Cross",
-                "تقاطع EMA9 أسفل EMA21"
-            )
-
-    # 11. Pin bar
-    candle_range = float(current["high"]) - float(current["low"])
-    body = abs(float(current["close"]) - float(current["open"]))
-
-    if candle_range > 0:
-        lower_wick = min(current["open"], current["close"]) - current["low"]
-        upper_wick = current["high"] - max(current["open"], current["close"])
-
-        if lower_wick >= candle_range * 0.60 and body <= candle_range * 0.30:
-            add_signal(
-                signals, "CALL", "Bullish Pin Bar",
-                "ذيل سفلي طويل يشير إلى رفض الهبوط"
-            )
-
-        if upper_wick >= candle_range * 0.60 and body <= candle_range * 0.30:
-            add_signal(
-                signals, "PUT", "Bearish Pin Bar",
-                "ذيل علوي طويل يشير إلى رفض الصعود"
-            )
-
-    # 12. Five-minute trend
-    ema20_5 = ema(closes5, 20)
-    ema50_5 = ema(closes5, 50)
-
-    if ema20_5 is not None and ema50_5 is not None:
-        if closes5[-1] > ema20_5 > ema50_5:
-            add_signal(
-                signals, "CALL", "5m Trend",
-                "الاتجاه العام على 5 دقائق صاعد"
-            )
-        elif closes5[-1] < ema20_5 < ema50_5:
-            add_signal(
-                signals, "PUT", "5m Trend",
-                "الاتجاه العام على 5 دقائق هابط"
-            )
-
-    # 13. MACD
-    fast_now = ema(closes, 12)
-    slow_now = ema(closes, 26)
-    fast_prev = ema(closes[:-1], 12)
-    slow_prev = ema(closes[:-1], 26)
-
-    if all(v is not None for v in (
-        fast_now, slow_now, fast_prev, slow_prev
-    )):
-        if fast_prev <= slow_prev and fast_now > slow_now:
-            add_signal(
-                signals, "CALL", "MACD Direction",
-                "تقاطع المتوسط السريع فوق البطيء"
-            )
-        elif fast_prev >= slow_prev and fast_now < slow_now:
-            add_signal(
-                signals, "PUT", "MACD Direction",
-                "تقاطع المتوسط السريع تحت البطيء"
-            )
-
-    if not signals:
+    if ema20 is None or ema50 is None or current_rsi is None:
         return None
 
-    call_signals = [s for s in signals if s["direction"] == "CALL"]
-    put_signals = [s for s in signals if s["direction"] == "PUT"]
+    metrics = candle_metrics(current)
 
-    # لا نرسل اتجاهين متعارضين على نفس السوق
-    if call_signals and put_signals:
+    if not metrics or metrics["body_ratio"] < 0.35:
+        return None
+
+    if trend_1m == "UP":
+        pullback = (
+            previous["low"] <= ema20 * 1.0015
+            or previous["low"] <= ema50 * 1.0015
+        )
+
+        recovery = (
+            current["close"] > current["open"]
+            and current["close"] > ema20
+            and current["close"] > previous["high"]
+            and 45 <= current_rsi <= 68
+        )
+
+        if pullback and recovery:
+            return (
+                "CALL",
+                "Trend Pullback: تصحيح ثم استئناف الاتجاه الصاعد"
+            )
+
+    if trend_1m == "DOWN":
+        pullback = (
+            previous["high"] >= ema20 * 0.9985
+            or previous["high"] >= ema50 * 0.9985
+        )
+
+        recovery = (
+            current["close"] < current["open"]
+            and current["close"] < ema20
+            and current["close"] < previous["low"]
+            and 32 <= current_rsi <= 55
+        )
+
+        if pullback and recovery:
+            return (
+                "PUT",
+                "Trend Pullback: تصحيح ثم استئناف الاتجاه الهابط"
+            )
+
+    return None
+
+
+def strategy_breakout_retest(candles, average_atr):
+    if len(candles) < 25 or average_atr is None:
+        return None
+
+    previous = candles[-2]
+    current = candles[-1]
+
+    reference = candles[-22:-2]
+
+    if len(reference) < 15:
+        return None
+
+    resistance = max(c["high"] for c in reference)
+    support = min(c["low"] for c in reference)
+
+    tolerance = average_atr * 0.25
+
+    bullish_retest = (
+        previous["close"] > resistance
+        and current["low"] <= resistance + tolerance
+        and current["close"] > resistance
+        and current["close"] > current["open"]
+    )
+
+    bearish_retest = (
+        previous["close"] < support
+        and current["high"] >= support - tolerance
+        and current["close"] < support
+        and current["close"] < current["open"]
+    )
+
+    if bullish_retest:
+        return (
+            "CALL",
+            "Breakout Retest: اختراق المقاومة وإعادة اختبارها"
+        )
+
+    if bearish_retest:
+        return (
+            "PUT",
+            "Breakout Retest: كسر الدعم وإعادة اختباره"
+        )
+
+    return None
+
+
+def analyze_signal(candles_1m, candles_5m, symbol=None):
+    candles_1m = valid_candles(candles_1m)
+    candles_5m = valid_candles(candles_5m)
+
+    if len(candles_1m) < MIN_CANDLES:
+        return None
+
+    if len(candles_5m) < 50:
+        return None
+
+    closes_1m = [c["close"] for c in candles_1m]
+
+    current = candles_1m[-1]
+    price = current["close"]
+
+    average_atr = atr(candles_1m)
+
+    if average_atr is None or average_atr <= 0:
+        return None
+
+    # تجاهل الحركة الضعيفة جداً أو الشمعة غير الطبيعية
+    current_metrics = candle_metrics(current)
+
+    if not current_metrics:
+        return None
+
+    if current_metrics["range"] < average_atr * 0.35:
+        return None
+
+    if current_metrics["range"] > average_atr * 3.0:
+        return None
+
+    trend_1m, ema20_1m, ema50_1m, ema200_1m = get_trend(candles_1m)
+    trend_5m, ema20_5m, ema50_5m, ema200_5m = get_trend(candles_5m)
+
+    current_rsi = rsi(closes_1m)
+
+    support, resistance = find_support_resistance(candles_1m)
+
+    strategies = [
+        strategy_support_rejection(
+            candles_1m, support, resistance, average_atr
+        ),
+        strategy_resistance_rejection(
+            candles_1m, support, resistance, average_atr
+        ),
+        strategy_trend_pullback(
+            candles_1m, candles_5m, trend_1m, trend_5m
+        ),
+        strategy_breakout_retest(
+            candles_1m, average_atr
+        )
+    ]
+
+    calls = []
+    puts = []
+
+    for result in strategies:
+        if result is None:
+            continue
+
+        direction, reason = result
+
+        if direction == "CALL":
+            calls.append((reason, direction))
+        elif direction == "PUT":
+            puts.append((reason, direction))
+
+    # لا نرسل إشارات متضاربة
+    if calls and puts:
         logger.info(
-            "Conflicting strategies for %s: CALL=%s PUT=%s",
+            "Signal conflict | symbol=%s | CALL=%s | PUT=%s",
             symbol,
-            [s["name"] for s in call_signals],
-            [s["name"] for s in put_signals],
+            len(calls),
+            len(puts)
         )
         return None
 
-    selected = call_signals if call_signals else put_signals
-    direction = selected[0]["direction"]
+    selected = calls if calls else puts
 
-    matching_strategies = list(dict.fromkeys(
-        s["name"] for s in selected
-    ))
+    if not selected:
+        return None
 
-    strategy_reasons = list(dict.fromkeys(
-        f'{s["name"]}: {s["reason"]}' for s in selected
-    ))
+    direction = selected[0][1]
 
-    trend = "UP" if price > (ema50 or price) else "DOWN"
+    matching_strategies = [item[0].split(":")[0] for item in selected]
+    strategy_reasons = [item[0] for item in selected]
 
-    result = {
+    # تقييم وصفي للنقاط، وليس احتمال نجاح
+    score = min(100, 70 + (len(selected) * 7))
+
+    return {
         "symbol": symbol,
         "direction": direction,
         "price": price,
-        "pattern": matching_strategies[0],
-        "score": len(selected),
+        "pattern": ", ".join(matching_strategies),
+        "score": score,
         "rsi": current_rsi,
         "adx": 0,
-        "atr": average_range,
-        "body_ratio": body / candle_range if candle_range else 0,
+        "atr": average_atr,
+        "body_ratio": current_metrics["body_ratio"],
         "expiry_minutes": 1,
         "status": "DEMO_ONLY",
         "strategy_votes": len(selected),
-        "confirmed_groups": len(selected),
+        "confirmed_groups": matching_strategies,
         "matching_strategies": matching_strategies,
         "opposing_strategies": [],
         "strategy_reasons": strategy_reasons,
         "support": support,
         "resistance": resistance,
-        "trend": trend,
+        "trend": trend_1m,
+        "trend_5m": trend_5m,
+        "ema200": ema200_1m
     }
 
-    return result
+
+_sent = set()
 
 
-def is_new_signal(symbol, signal):
+def is_new_signal(signal):
     if not signal:
         return False
 
-    strategies = tuple(signal.get("matching_strategies", []))
     key = (
-        symbol,
-        signal["direction"],
-        strategies,
-        round(float(signal["price"]), 6),
+        signal.get("symbol"),
+        signal.get("direction"),
+        tuple(signal.get("matching_strategies", [])),
+        round(float(signal.get("price", 0)), 6)
     )
 
     if key in _sent:
