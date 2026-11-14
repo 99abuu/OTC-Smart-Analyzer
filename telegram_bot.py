@@ -1,6 +1,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -40,19 +41,22 @@ def format_strategies(signal):
             else "تحققت شروط الاستراتيجية"
         )
 
-        lines.append(
-            f"• {name}\n  السبب: {reason}"
-        )
+        lines.append(f"• {name}\n  السبب: {reason}")
 
     return "\n".join(lines)
 
 
 def format_signal_details(signal):
+    strategies = signal.get("matching_strategies", [])
+
     return (
-        f"📚 الاستراتيجيات المتحققة "
-        f"({len(signal.get('matching_strategies', []))}):\n"
+        f"📚 الاستراتيجيات المتحققة ({len(strategies)}):\n"
         f"{format_strategies(signal)}"
     )
+
+
+def signal_phase(signal):
+    return signal.get("phase") or signal.get("status")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -69,8 +73,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
         "🔍 مراقبة أفضل 5 أدوات OTC\n"
         "⏱️ تنبيه قبل الدخول بـ60 ثانية\n"
-        "📊 متابعة نتائج الصفقات مفعّلة\n"
-        "🧠 استراتيجيات مستقلة متعددة\n\n"
+        "📊 متابعة نتائج الصفقات التجريبية\n"
+        "🧠 استراتيجيات مستقلة متعددة\n"
+        "📈 التحليل على فريم الدقيقة فقط\n\n"
         "/status - حالة البوت\n"
         "/analyze - تحليل يدوي\n"
         "/testsymbols - قائمة الأدوات\n\n"
@@ -90,6 +95,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 حالة OTC Smart Analyzer\n\n"
         f"الماسح: {'🟢 يعمل' if running else '🔴 متوقف'}\n"
         "الأدوات المستهدفة: 5\n"
+        "فريم التحليل: دقيقة واحدة فقط\n"
         "التنبيه المسبق: 60 ثانية\n"
         f"المشتركون الحاليون: {len(subscribers)}\n"
         "نظام التحليل: استراتيجيات مستقلة\n\n"
@@ -100,7 +106,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0] if context.args else None
 
-    await update.message.reply_text("🔍 جاري التحليل...")
+    await update.message.reply_text("🔍 جاري التحليل على فريم الدقيقة...")
 
     try:
         symbols = await asyncio.to_thread(fetch_otc_symbols)
@@ -114,24 +120,32 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None
             )
         else:
-            item = symbols[0] if symbols else None
+            item = next(
+                (
+                    s for s in symbols
+                    if s.get("isOtc") is True
+                    and s.get("open") is True
+                ),
+                None
+            )
 
         if not item:
             await update.message.reply_text(
-                "لم يتم العثور على الأداة."
+                "لم يتم العثور على أداة OTC مفتوحة."
             )
             return
 
         selected = item["symbol"]
 
-        candles_1m, candles_5m = await asyncio.gather(
-            asyncio.to_thread(fetch_candles, selected, 60, 300),
-            asyncio.to_thread(fetch_candles, selected, 300, 300)
+        candles_1m = await asyncio.to_thread(
+            fetch_candles,
+            selected,
+            60,
+            300
         )
 
         signal = analyze_signal(
             candles_1m,
-            candles_5m,
             symbol=selected
         )
 
@@ -145,6 +159,7 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = (
             "📡 تحليل يدوي تجريبي\n\n"
             f"الأداة: {selected}\n"
+            f"الفريم: 1 دقيقة\n"
             f"الاتجاه: {signal['direction']}\n"
             f"السعر المرجعي: {signal['price']}\n\n"
             f"{format_signal_details(signal)}\n\n"
@@ -164,19 +179,22 @@ async def testsymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         symbols = await asyncio.to_thread(fetch_otc_symbols)
 
+        symbols = [
+            item for item in symbols
+            if item.get("isOtc") is True
+            and item.get("open") is True
+        ]
+
         def payout_value(item):
             try:
                 return float(item.get("payout") or 0)
             except (TypeError, ValueError):
                 return 0
 
-        symbols.sort(
-            key=payout_value,
-            reverse=True
-        )
+        symbols.sort(key=payout_value, reverse=True)
 
         await update.message.reply_text(
-            "أفضل 5 أدوات OTC:\n\n" +
+            "أفضل 5 أدوات OTC المفتوحة:\n\n" +
             "\n".join(
                 f"{item['symbol']} | {item.get('payout')}%"
                 for item in symbols[:5]
@@ -222,46 +240,83 @@ async def post_init(app):
     app.bot_data["subscribers"] = set()
 
     async def notify(signal):
-        phase = signal.get("phase")
+        phase = signal_phase(signal)
+
+        strategies_text = format_signal_details(signal)
 
         if phase == "PRE_ALERT":
+            entry_time = (
+                signal.get("planned_entry_time")
+                or signal.get("entry_time")
+                or "بعد 60 ثانية تقريباً"
+            )
+
+            confirm_time = signal.get("confirm_time", "قبل الدخول بـ15 ثانية")
+
             message = (
                 "🔔 تنبيه فرصة OTC قادمة\n\n"
-                f"الأداة: {signal['symbol']}\n"
-                f"الاتجاه المتوقع: {signal['direction']}\n"
-                f"وقت التنبيه: {signal['alert_time']}\n"
-                f"موعد الدخول المقترح: {signal['planned_entry_time']}\n\n"
-                f"{format_signal_details(signal)}\n\n"
-                "⏳ الدخول المقترح بعد 60 ثانية.\n"
-                "سيعيد البوت فحص الاستراتيجية قبل تأكيد الدخول.\n"
+                f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
+                f"الاتجاه المتوقع: {signal.get('direction', 'غير محدد')}\n"
+                f"وقت التنبيه: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
+                f"موعد التأكيد: {confirm_time}\n"
+                f"موعد الدخول المقترح: {entry_time}\n\n"
+                f"{strategies_text}\n\n"
+                "⏳ سيعيد البوت فحص الإشارة قبل الدخول.\n"
+                "قد يتم إلغاؤها إذا تغيرت الشروط.\n"
                 "لا تدخل اعتماداً على هذا التنبيه وحده."
             )
 
         elif phase == "ENTRY":
+            entry_time = (
+                signal.get("entry_time")
+                or signal.get("planned_entry_time")
+                or "غير محدد"
+            )
+
+            entry_price = signal.get(
+                "entry_price",
+                signal.get("price", "غير محدد")
+            )
+
             message = (
                 "🚨 تأكيد دخول تجريبي\n\n"
-                f"الأداة: {signal['symbol']}\n"
-                f"الاتجاه: {signal['direction']}\n"
-                f"وقت الدخول الافتراضي: {signal['entry_time']}\n"
-                f"السعر المرجعي: {signal['entry_price']}\n\n"
-                f"{format_signal_details(signal)}\n\n"
+                f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
+                f"الاتجاه: {signal.get('direction', 'غير محدد')}\n"
+                f"وقت الدخول الافتراضي: {entry_time}\n"
+                f"السعر المرجعي: {entry_price}\n\n"
+                f"{strategies_text}\n\n"
                 "مدة الصفقة التجريبية: دقيقة واحدة\n\n"
                 "⚠️ هذه صفقة افتراضية وليست أمراً للتداول الحقيقي."
             )
 
         elif phase == "CANCELLED":
+            entry_time = (
+                signal.get("planned_entry_time")
+                or signal.get("entry_time")
+                or "غير محدد"
+            )
+
+            reason = (
+                signal.get("cancel_reason")
+                or signal.get("reason")
+                or "تغيرت شروط الإشارة"
+            )
+
             message = (
                 "❌ تم إلغاء فرصة OTC\n\n"
-                f"الأداة: {signal['symbol']}\n"
-                f"الاتجاه السابق: {signal['direction']}\n"
-                f"موعد الدخول: {signal['planned_entry_time']}\n"
-                f"السبب: {signal['cancel_reason']}\n\n"
-                f"{format_signal_details(signal)}\n\n"
+                f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
+                f"الاتجاه السابق: {signal.get('direction', 'غير محدد')}\n"
+                f"موعد الدخول: {entry_time}\n"
+                f"السبب: {reason}\n\n"
+                f"{strategies_text}\n\n"
                 "لم يتم تسجيل صفقة لهذه الفرصة."
             )
 
         else:
-            logger.error("Unknown signal phase: %s", phase)
+            logger.error(
+                "Unknown signal phase/status: %s",
+                phase
+            )
             return False
 
         return await send_to_subscribers(app, message)
@@ -275,6 +330,12 @@ async def post_init(app):
 
         strategies = result.get("strategies", [])
 
+        strategy_text = (
+            "\n".join(f"• {s}" for s in strategies)
+            if strategies
+            else "غير متوفرة"
+        )
+
         message = (
             "📊 نتيجة الصفقة التجريبية\n\n"
             f"{labels.get(result['result'], result['result'])}\n\n"
@@ -285,8 +346,8 @@ async def post_init(app):
             f"وقت البداية: {result['entry_time']}\n"
             f"وقت النهاية: {result['exit_time']}\n\n"
             "الاستراتيجيات:\n"
-            + "\n".join(f"• {s}" for s in strategies)
-            + "\n\n⚠️ النتيجة محسوبة من أسعار OTCharts، "
+            f"{strategy_text}\n\n"
+            "⚠️ النتيجة محسوبة من أسعار OTCharts، "
             "وليست تسوية Pocket Option الفعلية."
         )
 
