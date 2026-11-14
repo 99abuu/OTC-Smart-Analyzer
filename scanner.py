@@ -179,9 +179,7 @@ async def scanner_loop(send_signal, send_result):
     last_signal_time = {}
 
     async def cancel_alert(symbol, alert, reason):
-        signal = alert["signal"]
-
-        message = dict(signal)
+        message = dict(alert["signal"])
         message["status"] = "CANCELLED"
         message["reason"] = reason
 
@@ -259,16 +257,21 @@ async def scanner_loop(send_signal, send_result):
                             trade["entry_time"]
                         ),
                         "exit_time": format_time(timestamp),
-                        "result": result
+                        "result": result,
+                        "strategies": trade.get("strategies", []),
+                        "strategy_reasons": trade.get(
+                            "strategy_reasons", []
+                        )
                     }
 
                     await send_result(result_data)
 
                     logger.info(
-                        "PAPER RESULT: %s | %s | %s",
+                        "PAPER RESULT: %s | %s | %s | Strategies=%s",
                         symbol,
                         trade["direction"],
-                        result
+                        result,
+                        trade.get("strategies", [])
                     )
 
                     pending_trades.pop(symbol, None)
@@ -337,8 +340,6 @@ async def scanner_loop(send_signal, send_result):
                         )
 
                         if valid:
-                            alert["status"] = "CONFIRMED"
-
                             message = dict(alert["signal"])
                             message["status"] = "ENTRY"
                             message["entry_time"] = format_time(
@@ -346,10 +347,29 @@ async def scanner_loop(send_signal, send_result):
                             )
                             message["confirmation"] = reason
 
-                            await send_signal(message)
+                            try:
+                                delivered = await send_signal(message)
+                            except Exception:
+                                logger.exception(
+                                    "Entry confirmation delivery failed: %s",
+                                    symbol
+                                )
+                                delivered = False
+
+                            if not delivered:
+                                pending_alerts.pop(symbol, None)
+
+                                logger.warning(
+                                    "ENTRY CONFIRMATION NOT DELIVERED; "
+                                    "PAPER TRADE BLOCKED: %s",
+                                    symbol
+                                )
+                                continue
+
+                            alert["status"] = "CONFIRMED"
 
                             logger.info(
-                                "SIGNAL CONFIRMED: %s | %s",
+                                "SIGNAL CONFIRMED AND DELIVERED: %s | %s",
                                 symbol,
                                 alert["signal"]["direction"]
                             )
@@ -392,13 +412,20 @@ async def scanner_loop(send_signal, send_result):
                             "direction": signal["direction"],
                             "entry_price": price,
                             "entry_time": timestamp,
-                            "settles_at": timestamp + TRADE_DURATION
+                            "settles_at": timestamp + TRADE_DURATION,
+                            "strategies": list(
+                                signal.get("matching_strategies", [])
+                            ),
+                            "strategy_reasons": list(
+                                signal.get("strategy_reasons", [])
+                            )
                         }
 
                         logger.info(
-                            "PAPER TRADE STARTED: %s | %s",
+                            "PAPER TRADE STARTED: %s | %s | Strategies=%s",
                             symbol,
-                            signal["direction"]
+                            signal["direction"],
+                            signal.get("matching_strategies", [])
                         )
 
                         pending_alerts.pop(symbol, None)
@@ -430,8 +457,6 @@ async def scanner_loop(send_signal, send_result):
                 if timestamp - previous_time < 60:
                     continue
 
-                last_signal_time[symbol] = timestamp
-
                 signal["symbol"] = symbol
                 signal["price"] = price
                 signal["expiry_minutes"] = 1
@@ -441,7 +466,7 @@ async def scanner_loop(send_signal, send_result):
                 entry_at = timestamp + PRE_ENTRY_SECONDS
                 confirm_at = entry_at - CONFIRM_BEFORE_ENTRY
 
-                pending_alerts[symbol] = {
+                alert = {
                     "signal": signal,
                     "entry_at": entry_at,
                     "confirm_at": confirm_at,
@@ -459,10 +484,29 @@ async def scanner_loop(send_signal, send_result):
                 message["entry_time"] = format_time(entry_at)
                 message["confirm_time"] = format_time(confirm_at)
 
-                await send_signal(message)
+                try:
+                    delivered = await send_signal(message)
+                except Exception:
+                    logger.exception(
+                        "Pre-alert delivery failed for %s",
+                        symbol
+                    )
+                    delivered = False
+
+                if not delivered:
+                    pending_alerts.pop(symbol, None)
+
+                    logger.warning(
+                        "PRE-ALERT NOT DELIVERED; SIGNAL DISCARDED: %s",
+                        symbol
+                    )
+                    continue
+
+                pending_alerts[symbol] = alert
+                last_signal_time[symbol] = timestamp
 
                 logger.info(
-                    "PRE-ALERT SENT: %s %s | confirm=%s | entry=%s",
+                    "PRE-ALERT DELIVERED: %s %s | confirm=%s | entry=%s",
                     symbol,
                     signal["direction"],
                     format_time(confirm_at),
