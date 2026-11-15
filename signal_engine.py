@@ -218,11 +218,7 @@ def adx(candles, period=ADX_PERIOD):
 
     plus_di, minus_di = calculate_di()
 
-    return (
-        current_adx,
-        plus_di,
-        minus_di
-    )
+    return current_adx, plus_di, minus_di
 
 
 def candle_metrics(candle):
@@ -263,7 +259,6 @@ def get_trend(candles):
     price = closes[-1]
 
     if ema200 is not None:
-
         if (
             price > ema200
             and ema50 > ema200
@@ -559,10 +554,7 @@ def calculate_signal_score(
 
     score = 45.0
 
-    # توافق أكثر من استراتيجية مستقلة
     score += min(12, max(0, len(selected) - 1) * 6)
-
-    # جودة شمعة الإشارة
     score += metrics["body_ratio"] * 10
 
     if direction == "CALL":
@@ -570,7 +562,6 @@ def calculate_signal_score(
     else:
         score += (1 - metrics["close_position"]) * 8
 
-    # توافق الاتجاه
     if (
         (direction == "CALL" and trend == "UP")
         or (direction == "PUT" and trend == "DOWN")
@@ -580,21 +571,16 @@ def calculate_signal_score(
     elif trend in ("UP", "DOWN"):
         score -= 3
 
-    # EMA200
     if ema200 is not None:
         if (
-            direction == "CALL"
-            and price > ema200
+            direction == "CALL" and price > ema200
         ) or (
-            direction == "PUT"
-            and price < ema200
+            direction == "PUT" and price < ema200
         ):
             score += 5
-
         else:
             score -= 3
 
-    # RSI
     if current_rsi is not None:
         if direction == "CALL":
             if 45 <= current_rsi <= 68:
@@ -612,7 +598,6 @@ def calculate_signal_score(
             elif current_rsi > 70:
                 score -= 2
 
-    # ADX يقيس قوة الاتجاه وليس اتجاهه
     if current_adx is not None:
         if current_adx >= 25:
             score += 5
@@ -621,7 +606,6 @@ def calculate_signal_score(
         elif current_adx < 12:
             score -= 3
 
-    # تأكيد اتجاه DI
     if plus_di is not None and minus_di is not None:
         if direction == "CALL" and plus_di > minus_di:
             score += 3
@@ -630,7 +614,6 @@ def calculate_signal_score(
         else:
             score -= 2
 
-    # تجنب المبالغة في الحركة مقارنة بمتوسط ATR
     if average_atr and average_atr > 0:
         range_ratio = metrics["range"] / average_atr
 
@@ -642,8 +625,70 @@ def calculate_signal_score(
     return round(max(0, min(95, score)), 1)
 
 
-def analyze_signal(candles_1m, candles_5m=None, symbol=None):
+def select_trade_duration(signal):
+    """
+    Experimental rule-based duration selection.
+    Returns 60 or 120 seconds and an explanation.
+    This is not an AI model or a win probability.
+    """
 
+    direction = signal.get("direction")
+    trend = signal.get("trend")
+    adx_value = signal.get("adx")
+    body_ratio = signal.get("body_ratio")
+    range_ratio = signal.get("range_ratio")
+    rsi_value = signal.get("rsi")
+    strategies = signal.get("matching_strategies", [])
+
+    trend_aligned = (
+        (direction == "CALL" and trend == "UP")
+        or (direction == "PUT" and trend == "DOWN")
+    )
+
+    continuation_signal = (
+        "Trend Pullback" in strategies
+        or "Breakout Retest" in strategies
+    )
+
+    if (
+        trend_aligned
+        and continuation_signal
+        and adx_value is not None
+        and adx_value >= 22
+        and body_ratio is not None
+        and body_ratio >= 0.40
+        and range_ratio is not None
+        and 0.65 <= range_ratio <= 1.8
+        and rsi_value is not None
+        and 30 <= rsi_value <= 70
+    ):
+        return (
+            120,
+            "اتجاه متوافق وزخم مناسب واستمرار محتمل للحركة"
+        )
+
+    if (
+        "Support Rejection" in strategies
+        or "Resistance Rejection" in strategies
+    ):
+        return (
+            60,
+            "ارتداد من دعم أو مقاومة؛ اختيار مدة أقصر للاختبار"
+        )
+
+    if not trend_aligned:
+        return (
+            60,
+            "الاتجاه غير متوافق بوضوح؛ اختيار مدة أقصر للاختبار"
+        )
+
+    return (
+        60,
+        "شروط الاستمرار لمدة دقيقتين غير مكتملة"
+    )
+
+
+def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     # التحليل بالكامل على فريم الدقيقة.
     # لا نستخدم بيانات 5m.
 
@@ -667,7 +712,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     if not current_metrics:
         return None
 
-    # تجنب الشموع شديدة الهدوء أو شديدة العنف
     if current_metrics["range"] < average_atr * 0.35:
         return None
 
@@ -679,6 +723,12 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     current_rsi = rsi(closes)
 
     current_adx, plus_di, minus_di = adx(candles)
+
+    range_ratio = (
+        current_metrics["range"] / average_atr
+        if average_atr > 0
+        else None
+    )
 
     support, resistance = find_support_resistance(candles)
 
@@ -724,7 +774,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         elif direction == "PUT":
             puts.append((reason, direction))
 
-    # منع الإشارات المتضاربة
     if calls and puts:
         logger.info(
             "Signal conflict | symbol=%s | CALL=%s | PUT=%s",
@@ -766,7 +815,7 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         average_atr=average_atr
     )
 
-    return {
+    signal = {
         "symbol": symbol,
         "direction": direction,
         "price": price,
@@ -778,7 +827,12 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         "minus_di": minus_di,
         "atr": average_atr,
         "body_ratio": current_metrics["body_ratio"],
+        "range_ratio": range_ratio,
+        "close_position": current_metrics["close_position"],
         "expiry_minutes": 1,
+        "duration_seconds": 60,
+        "selected_duration": 60,
+        "duration_reason": "",
         "status": "DEMO_ONLY",
         "strategy_votes": len(selected),
         "confirmed_groups": matching_strategies,
@@ -795,9 +849,19 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         "analysis_timeframe": "1m"
     }
 
+    selected_duration, duration_reason = (
+        select_trade_duration(signal)
+    )
+
+    signal["selected_duration"] = selected_duration
+    signal["duration_seconds"] = selected_duration
+    signal["expiry_minutes"] = selected_duration // 60
+    signal["duration_reason"] = duration_reason
+
+    return signal
+
 
 def is_new_signal(signal):
-
     if not signal:
         return False
 
