@@ -1,6 +1,9 @@
 
 import asyncio
 import logging
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
 from datetime import datetime, timezone
 
 from telegram import Update
@@ -23,6 +26,8 @@ logging.basicConfig(
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+HISTORY_FILE = Path(__file__).with_name("trade_history.jsonl")
 
 
 def format_strategies(signal):
@@ -59,6 +64,168 @@ def signal_phase(signal):
     return signal.get("phase") or signal.get("status")
 
 
+def read_trade_history():
+    signals = {}
+    results = {}
+    updates = defaultdict(set)
+
+    if not HISTORY_FILE.exists():
+        return signals, results, updates
+
+    with HISTORY_FILE.open("r", encoding="utf-8") as file:
+        for line in file:
+            try:
+                event = json.loads(line)
+                event_type = event.get("event")
+                signal_id = event.get("signal_id")
+
+                if not signal_id:
+                    continue
+
+                if event_type == "signal":
+                    signals[signal_id] = event.get("signal", {})
+
+                elif event_type == "update":
+                    status = str(event.get("status", "")).upper()
+                    updates[signal_id].add(status)
+
+                elif event_type == "result":
+                    results[signal_id] = event
+
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    return signals, results, updates
+
+
+def build_stats_message(data):
+    signals, results, updates = data
+
+    valid_results = {}
+
+    for signal_id, result in results.items():
+        outcome = str(result.get("outcome", "")).upper()
+
+        if outcome in ("WIN", "LOSS", "DRAW"):
+            valid_results[signal_id] = result
+
+    outcomes = Counter(
+        result["outcome"] for result in valid_results.values()
+    )
+
+    wins = outcomes["WIN"]
+    losses = outcomes["LOSS"]
+    draws = outcomes["DRAW"]
+
+    completed = wins + losses + draws
+    decisive = wins + losses
+
+    win_rate = (
+        wins / decisive * 100
+        if decisive
+        else 0
+    )
+
+    cancelled_ids = {
+        signal_id
+        for signal_id, statuses in updates.items()
+        if any("CANCEL" in status for status in statuses)
+    }
+
+    lines = [
+        "📊 إحصائيات OTC Smart Analyzer",
+        "",
+        f"📨 الإشارات المسجلة: {len(signals)}",
+        f"📈 الصفقات المكتملة: {completed}",
+        "",
+        f"🟢 WIN: {wins}",
+        f"🔴 LOSS: {losses}",
+        f"🟡 DRAW: {draws}",
+        f"🎯 نسبة الفوز: {win_rate:.1f}%",
+        f"❌ الإشارات الملغاة: {len(cancelled_ids)}",
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "📚 أداء الاستراتيجيات"
+    ]
+
+    strategy_stats = defaultdict(Counter)
+
+    for signal_id, result in valid_results.items():
+        signal = signals.get(signal_id, {})
+        strategies = signal.get("matching_strategies", [])
+
+        for strategy in set(strategies):
+            strategy_stats[strategy][result["outcome"]] += 1
+
+    if strategy_stats:
+        for strategy, stats in sorted(
+            strategy_stats.items(),
+            key=lambda item: (
+                item[1]["WIN"] /
+                max(1, item[1]["WIN"] + item[1]["LOSS"]),
+                item[1]["WIN"] + item[1]["LOSS"]
+            ),
+            reverse=True
+        ):
+            total = stats["WIN"] + stats["LOSS"] + stats["DRAW"]
+            decisive = stats["WIN"] + stats["LOSS"]
+            rate = stats["WIN"] / decisive * 100 if decisive else 0
+
+            lines.append(
+                f"\n• {strategy}\n"
+                f"  {stats['WIN']}W / {stats['LOSS']}L / "
+                f"{stats['DRAW']}D | الفوز {rate:.1f}% | "
+                f"الإجمالي {total}"
+            )
+    else:
+        lines.append("\nلا توجد بيانات استراتيجية مكتملة بعد.")
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "🌍 أداء الأسواق"
+    ])
+
+    market_stats = defaultdict(Counter)
+
+    for signal_id, result in valid_results.items():
+        signal = signals.get(signal_id, {})
+        symbol = signal.get("symbol", "غير معروف")
+        market_stats[symbol][result["outcome"]] += 1
+
+    if market_stats:
+        for symbol, stats in sorted(
+            market_stats.items(),
+            key=lambda item: item[1]["WIN"] + item[1]["LOSS"],
+            reverse=True
+        ):
+            decisive = stats["WIN"] + stats["LOSS"]
+            rate = stats["WIN"] / decisive * 100 if decisive else 0
+
+            lines.append(
+                f"\n• {symbol}: "
+                f"{stats['WIN']}W / {stats['LOSS']}L / "
+                f"{stats['DRAW']}D | {rate:.1f}%"
+            )
+    else:
+        lines.append("\nلا توجد نتائج أسواق محفوظة بعد.")
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "⚠️ الإحصائيات مبنية على سجل Paper Trading المحلي.",
+        "قد لا تشمل النتائج السابقة التي لم تُحفظ في هذا الملف.",
+        "وهي ليست نتائج تسوية Pocket Option الفعلية."
+    ])
+
+    message = "\n".join(lines)
+
+    if len(message) > 4000:
+        message = message[:3950] + "\n\n... تم اختصار التقرير."
+
+    return message
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -78,7 +245,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📈 التحليل على فريم الدقيقة فقط\n\n"
         "/status - حالة البوت\n"
         "/analyze - تحليل يدوي\n"
-        "/testsymbols - قائمة الأدوات\n\n"
+        "/testsymbols - قائمة الأدوات\n"
+        "/stats - إحصائيات الأداء\n\n"
         "⚠️ جميع النتائج تجريبية وليست ضماناً للربح."
     )
 
@@ -101,6 +269,25 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "نظام التحليل: استراتيجيات مستقلة\n\n"
         "⚠️ النتائج تجريبية فقط."
     )
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📊 جاري قراءة سجل الصفقات..."
+    )
+
+    try:
+        data = await asyncio.to_thread(read_trade_history)
+        message = build_stats_message(data)
+
+        await update.message.reply_text(message)
+
+    except Exception:
+        logger.exception("Statistics generation failed")
+
+        await update.message.reply_text(
+            "❌ تعذر قراءة سجل الصفقات. راجع سجلات التشغيل."
+        )
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,6 +575,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("testsymbols", testsymbols))
+    app.add_handler(CommandHandler("stats", stats))
 
     logger.info("OTC Smart Analyzer starting...")
     app.run_polling()
