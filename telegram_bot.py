@@ -68,9 +68,10 @@ def read_trade_history():
     signals = {}
     results = {}
     updates = defaultdict(set)
+    horizon_results = defaultdict(dict)
 
     if not HISTORY_FILE.exists():
-        return signals, results, updates
+        return signals, results, updates, horizon_results
 
     with HISTORY_FILE.open("r", encoding="utf-8") as file:
         for line in file:
@@ -92,14 +93,102 @@ def read_trade_history():
                 elif event_type == "result":
                     results[signal_id] = event
 
+                elif event_type == "horizon_result":
+                    try:
+                        horizon = int(event.get("horizon_seconds"))
+                    except (TypeError, ValueError):
+                        continue
+
+                    outcome = str(event.get("outcome", "")).upper()
+
+                    if horizon not in (60, 120):
+                        continue
+
+                    if outcome not in ("WIN", "LOSS", "DRAW"):
+                        continue
+
+                    horizon_results[signal_id][horizon] = event
+
             except (json.JSONDecodeError, TypeError):
                 continue
 
-    return signals, results, updates
+    return signals, results, updates, horizon_results
+
+
+def build_horizon_stats(horizon_results):
+    stats = {
+        60: Counter(),
+        120: Counter()
+    }
+
+    paired = {
+        "60_better": 0,
+        "120_better": 0,
+        "same": 0
+    }
+
+    outcome_score = {
+        "LOSS": 0,
+        "DRAW": 1,
+        "WIN": 2
+    }
+
+    for signal_id, horizons in horizon_results.items():
+        for duration in (60, 120):
+            event = horizons.get(duration)
+
+            if event:
+                outcome = str(event.get("outcome", "")).upper()
+
+                if outcome in ("WIN", "LOSS", "DRAW"):
+                    stats[duration][outcome] += 1
+
+        result_60 = horizons.get(60)
+        result_120 = horizons.get(120)
+
+        if result_60 and result_120:
+            outcome_60 = str(result_60.get("outcome", "")).upper()
+            outcome_120 = str(result_120.get("outcome", "")).upper()
+
+            if (
+                outcome_60 not in outcome_score
+                or outcome_120 not in outcome_score
+            ):
+                continue
+
+            if outcome_score[outcome_60] > outcome_score[outcome_120]:
+                paired["60_better"] += 1
+
+            elif outcome_score[outcome_120] > outcome_score[outcome_60]:
+                paired["120_better"] += 1
+
+            else:
+                paired["same"] += 1
+
+    return stats, paired
+
+
+def format_horizon_line(duration, stats):
+    wins = stats["WIN"]
+    losses = stats["LOSS"]
+    draws = stats["DRAW"]
+
+    completed = wins + losses + draws
+    decisive = wins + losses
+
+    rate = wins / decisive * 100 if decisive else 0
+
+    return (
+        f"\n⏱️ مدة {duration} ثانية:\n"
+        f"  🟢 {wins} WIN | 🔴 {losses} LOSS | "
+        f"🟡 {draws} DRAW\n"
+        f"  🎯 نسبة الفوز: {rate:.1f}%\n"
+        f"  📊 المكتملة: {completed}"
+    )
 
 
 def build_stats_message(data):
-    signals, results, updates = data
+    signals, results, updates, horizon_results = data
 
     valid_results = {}
 
@@ -110,7 +199,8 @@ def build_stats_message(data):
             valid_results[signal_id] = result
 
     outcomes = Counter(
-        result["outcome"] for result in valid_results.values()
+        str(result["outcome"]).upper()
+        for result in valid_results.values()
     )
 
     wins = outcomes["WIN"]
@@ -141,8 +231,31 @@ def build_stats_message(data):
         f"❌ الإشارات الملغاة: {len(cancelled_ids)}",
         "",
         "━━━━━━━━━━━━━━━━",
-        "📚 أداء الاستراتيجيات"
+        "⏱️ مقارنة مدة الصفقة",
     ]
+
+    horizon_stats, paired = build_horizon_stats(horizon_results)
+
+    lines.append(format_horizon_line(60, horizon_stats[60]))
+    lines.append(format_horizon_line(120, horizon_stats[120]))
+
+    paired_count = (
+        paired["60_better"]
+        + paired["120_better"]
+        + paired["same"]
+    )
+
+    lines.extend([
+        "",
+        "📊 مقارنة الإشارات المشتركة على المدتين:",
+        f"  عدد الإشارات المكتملة على المدتين: {paired_count}",
+        f"  🟢 نتيجة 60 ثانية أفضل: {paired['60_better']}",
+        f"  🔵 نتيجة 120 ثانية أفضل: {paired['120_better']}",
+        f"  🟡 نفس النتيجة: {paired['same']}",
+        "",
+        "━━━━━━━━━━━━━━━━",
+        "📚 أداء الاستراتيجيات"
+    ])
 
     strategy_stats = defaultdict(Counter)
 
@@ -210,6 +323,7 @@ def build_stats_message(data):
         "",
         "━━━━━━━━━━━━━━━━",
         "⚠️ الإحصائيات مبنية على سجل Paper Trading المحلي.",
+        "مقارنة المدتين تعتمد على الإشارات التي حُفظت نتائجها.",
         "قد لا تشمل النتائج السابقة التي لم تُحفظ في هذا الملف.",
         "وهي ليست نتائج تسوية Pocket Option الفعلية."
     ])
