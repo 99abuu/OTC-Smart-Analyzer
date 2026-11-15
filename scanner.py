@@ -35,6 +35,9 @@ HISTORY_1M = 250
 MIN_CANDLES_1M = 200
 MAX_CANDLES = 400
 
+# OTC stream timestamps are 2 hours ahead of UTC server time.
+OTC_TICK_TIME_OFFSET_SECONDS = 7200
+
 
 def format_time(timestamp):
     return datetime.fromtimestamp(
@@ -425,6 +428,10 @@ async def scanner_loop(send_signal, send_result):
         "1m candle history target: %s",
         HISTORY_1M
     )
+    logger.info(
+        "OTC tick timestamp correction: -%s seconds",
+        OTC_TICK_TIME_OFFSET_SECONDS
+    )
 
     selected, initial_histories = await asyncio.to_thread(
         rank_otc_markets,
@@ -647,12 +654,18 @@ async def scanner_loop(send_signal, send_result):
                     continue
 
                 price = parse_number(tick.get("price"))
-                timestamp = parse_number(tick.get("time"))
 
-                if price <= 0 or timestamp <= 0:
+                raw_timestamp = parse_number(tick.get("time"))
+
+                if price <= 0 or raw_timestamp <= 0:
                     continue
 
-                if symbol not in candles_1m:
+                # Correct the OTC stream timestamp to UTC.
+                timestamp = (
+                    raw_timestamp - OTC_TICK_TIME_OFFSET_SECONDS
+                )
+
+                if timestamp <= 0:
                     continue
 
                 minute_bucket = int(timestamp // 60) * 60
