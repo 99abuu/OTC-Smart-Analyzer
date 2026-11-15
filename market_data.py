@@ -1,10 +1,14 @@
 
 import os
 import json
+import time
+import logging
 import urllib.request
 import urllib.error
 import urllib.parse
 
+
+logger = logging.getLogger(__name__)
 
 API_URL = "https://otcharts.com/v1/candles"
 SYMBOLS_URL = "https://otcharts.com/v1/symbols"
@@ -133,6 +137,7 @@ def stream_ticks(symbols):
         with urllib.request.urlopen(request, timeout=90) as response:
             event_name = "message"
             data_lines = []
+            diagnosed_symbols = set()
 
             for raw_line in response:
                 line = raw_line.decode(
@@ -143,6 +148,39 @@ def stream_ticks(symbols):
                     if data_lines:
                         payload = json.loads("\n".join(data_lines))
                         payload["_event"] = event_name
+
+                        if (
+                            event_name == "tick"
+                            and isinstance(payload, dict)
+                        ):
+                            symbol = payload.get("symbol")
+
+                            if symbol not in diagnosed_symbols:
+                                raw_tick_time = payload.get("time")
+                                server_time = time.time()
+
+                                try:
+                                    tick_time = float(raw_tick_time)
+                                    difference = tick_time - server_time
+                                except (TypeError, ValueError):
+                                    difference = None
+
+                                logger.info(
+                                    "TIME DIAGNOSTIC | symbol=%s | "
+                                    "raw_tick_time=%r | server_time=%.3f | "
+                                    "difference_seconds=%s",
+                                    symbol,
+                                    raw_tick_time,
+                                    server_time,
+                                    (
+                                        round(difference, 3)
+                                        if difference is not None
+                                        else "INVALID_TIMESTAMP"
+                                    )
+                                )
+
+                                diagnosed_symbols.add(symbol)
+
                         yield payload
 
                     event_name = "message"
