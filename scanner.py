@@ -13,7 +13,8 @@ from signal_engine import analyze_signal, is_new_signal
 from trade_history import (
     record_signal,
     record_update,
-    record_result
+    record_result,
+    record_horizon_result
 )
 
 
@@ -24,6 +25,9 @@ MAX_CANDIDATES = 18
 MARKET_REFRESH_SECONDS = 300
 
 TRADE_DURATION = 60
+COMPARISON_DURATIONS = (60, 120)
+MAX_HORIZON_DELAY = 10
+
 PRE_ENTRY_SECONDS = 60
 CONFIRM_BEFORE_ENTRY = 15
 MAX_ENTRY_DELAY = 10
@@ -46,6 +50,24 @@ def parse_number(value, default=0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def calculate_outcome(direction, entry_price, exit_price):
+    if direction == "CALL":
+        if exit_price > entry_price:
+            return "WIN"
+        if exit_price < entry_price:
+            return "LOSS"
+        return "DRAW"
+
+    if direction == "PUT":
+        if exit_price < entry_price:
+            return "WIN"
+        if exit_price > entry_price:
+            return "LOSS"
+        return "DRAW"
+
+    return "DRAW"
 
 
 def valid_market_candles(candles):
@@ -395,6 +417,10 @@ async def scanner_loop(send_signal, send_result):
     logger.info("Analysis timeframe: 1m only")
     logger.info("Dynamic market selection enabled")
     logger.info("Trade history recording enabled")
+    logger.info(
+        "Dual-duration comparison enabled: %s seconds",
+        COMPARISON_DURATIONS
+    )
 
     logger.info(
         "Market refresh interval: %s seconds",
@@ -634,48 +660,55 @@ async def scanner_loop(send_signal, send_result):
 
                 minute_bucket = int(timestamp // 60) * 60
 
+                # -------------------------------------------------
+                # Dual-duration paper comparison: 60s and 120s
+                # Both measurements use the exact same entry price.
+                # -------------------------------------------------
+
                 trade = pending_trades.get(symbol)
 
-                if trade and timestamp >= trade["settles_at"]:
-                    exit_price = price
+                if trade:
+                    for horizon in COMPARISON_DURATIONS:
+                        if horizon in trade["processed_horizons"]:
+                            continue
 
-                    if trade["direction"] == "CALL":
-                        if exit_price > trade["entry_price"]:
-                            result = "WIN"
-                        elif exit_price < trade["entry_price"]:
-                            result = "LOSS"
-                        else:
-                            result = "DRAW"
-                    else:
-                        if exit_price < trade["entry_price"]:
-                            result = "WIN"
-                        elif exit_price > trade["entry_price"]:
-                            result = "LOSS"
-                        else:
-                            result = "DRAW"
+                        target_time = trade["entry_time"] + horizon
 
-                    result_data = {
-                        "symbol": symbol,
-                        "direction": trade["direction"],
-                        "entry_price": trade["entry_price"],
-                        "exit_price": exit_price,
-                        "entry_time": format_time(
-                            trade["entry_time"]
-                        ),
-                        "exit_time": format_time(timestamp),
-                        "result": result,
-                        "strategies": trade.get("strategies", []),
-                        "strategy_reasons": trade.get(
-                            "strategy_reasons", []
+                        if timestamp < target_time:
+                            continue
+
+                        delay = timestamp - target_time
+
+                        if delay > MAX_HORIZON_DELAY:
+                            record_update(
+                                trade.get("history_id"),
+                                "HORIZON_RESULT_MISSED",
+                                {
+                                    "horizon_seconds": horizon,
+                                    "target_time": target_time,
+                                    "observed_time": timestamp,
+                                    "delay_seconds": delay
+                                }
+                            )
+
+                            logger.warning(
+                                "HORIZON RESULT MISSED: %s | %ss | "
+                                "tick delayed by %ss",
+                                symbol,
+                                horizon,
+                                delay
+                            )
+
+                            trade["processed_horizons"].add(horizon)
+                            continue
+
+                        outcome = calculate_outcome(
+                            trade["direction"],
+                            trade["entry_price"],
+                            price
                         )
-                    }
 
-                    record_result(
-                        trade.get("history_id"),
-                        result,
-                        entry_price=trade["entry_price"],
-                        exit_price=exit_price,
-                        details={
+                        horizon_details = {
                             "symbol": symbol,
                             "direction": trade["direction"],
                             "strategies": trade.get("strategies", []),
@@ -683,21 +716,95 @@ async def scanner_loop(send_signal, send_result):
                                 "strategy_reasons", []
                             ),
                             "entry_time": trade["entry_time"],
-                            "exit_time": timestamp
+                            "target_time": target_time,
+                            "observed_time": timestamp,
+                            "delay_seconds": delay,
+                            "measurement_price": price
                         }
-                    )
 
-                    await send_result(result_data)
+                        saved = record_horizon_result(
+                            trade.get("history_id"),
+                            horizon,
+                            outcome,
+                            entry_price=trade["entry_price"],
+                            exit_price=price,
+                            details=horizon_details
+                        )
 
-                    logger.info(
-                        "PAPER RESULT: %s | %s | %s | Strategies=%s",
-                        symbol,
-                        trade["direction"],
-                        result,
-                        trade.get("strategies", [])
-                    )
+                        trade["processed_horizons"].add(horizon)
 
-                    pending_trades.pop(symbol, None)
+                        if saved:
+                            logger.info(
+                                "HORIZON RESULT: %s | %ss | %s | "
+                                "entry=%s | exit=%s",
+                                symbol,
+                                horizon,
+                                outcome,
+                                trade["entry_price"],
+                                price
+                            )
+
+                        # Keep the existing one-minute result behavior.
+                        if horizon == TRADE_DURATION:
+                            result_data = {
+                                "symbol": symbol,
+                                "direction": trade["direction"],
+                                "entry_price": trade["entry_price"],
+                                "exit_price": price,
+                                "entry_time": format_time(
+                                    trade["entry_time"]
+                                ),
+                                "exit_time": format_time(timestamp),
+                                "result": outcome,
+                                "strategies": trade.get("strategies", []),
+                                "strategy_reasons": trade.get(
+                                    "strategy_reasons", []
+                                )
+                            }
+
+                            record_result(
+                                trade.get("history_id"),
+                                outcome,
+                                entry_price=trade["entry_price"],
+                                exit_price=price,
+                                details=horizon_details
+                            )
+
+                            try:
+                                await send_result(result_data)
+                            except Exception:
+                                logger.exception(
+                                    "One-minute result delivery failed: %s",
+                                    symbol
+                                )
+
+                            logger.info(
+                                "PAPER RESULT 60s: %s | %s | %s | "
+                                "Strategies=%s",
+                                symbol,
+                                trade["direction"],
+                                outcome,
+                                trade.get("strategies", [])
+                            )
+
+                    if all(
+                        horizon in trade["processed_horizons"]
+                        for horizon in COMPARISON_DURATIONS
+                    ):
+                        record_update(
+                            trade.get("history_id"),
+                            "DURATION_COMPARISON_COMPLETED",
+                            {
+                                "durations": list(COMPARISON_DURATIONS)
+                            }
+                        )
+
+                        logger.info(
+                            "DURATION COMPARISON COMPLETED: %s",
+                            symbol
+                        )
+
+                        pending_trades.pop(symbol, None)
 
                 candle = current_1m.get(symbol)
 
@@ -847,14 +954,14 @@ async def scanner_loop(send_signal, send_result):
                             "direction": signal["direction"],
                             "entry_price": price,
                             "entry_time": timestamp,
-                            "settles_at": timestamp + TRADE_DURATION,
                             "strategies": list(
                                 signal.get("matching_strategies", [])
                             ),
                             "strategy_reasons": list(
                                 signal.get("strategy_reasons", [])
                             ),
-                            "history_id": alert.get("history_id")
+                            "history_id": alert.get("history_id"),
+                            "processed_horizons": set()
                         }
 
                         record_update(
@@ -863,20 +970,26 @@ async def scanner_loop(send_signal, send_result):
                             {
                                 "entry_price": price,
                                 "entry_time": timestamp,
-                                "settles_at": timestamp + TRADE_DURATION
+                                "comparison_durations": list(
+                                    COMPARISON_DURATIONS
+                                )
                             }
                         )
 
                         logger.info(
-                            "PAPER TRADE STARTED: %s | %s | Strategies=%s",
+                            "PAPER TRADE STARTED: %s | %s | "
+                            "Entry=%s | Comparison=60s/120s | Strategies=%s",
                             symbol,
                             signal["direction"],
+                            price,
                             signal.get("matching_strategies", [])
                         )
 
                         pending_alerts.pop(symbol, None)
                         continue
 
+                # Keep the same symbol unavailable until both
+                # comparison measurements have been processed.
                 if symbol in pending_trades:
                     continue
 
