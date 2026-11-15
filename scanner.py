@@ -4,11 +4,17 @@ import logging
 import threading
 import queue
 import time
+import math
+
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from statistics import mean
 
-from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
+from market_data import (
+    fetch_otc_symbols,
+    fetch_candles,
+    stream_ticks
+)
 
 from signal_engine import (
     analyze_signal,
@@ -41,11 +47,10 @@ HISTORY_1M = 250
 MIN_CANDLES_1M = 200
 MAX_CANDLES = 400
 
-# OTC stream timestamps are 2 hours ahead of UTC server time.
+# Both OTC API candles and stream ticks are 2 hours
+# ahead of the UTC server clock.
 OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
-# Local timezone for Northern Cyprus.
-# Automatically handles summer/winter time.
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
 
 
@@ -70,7 +75,14 @@ def parse_number(value, default=0):
     try:
         if isinstance(value, str):
             value = value.replace("%", "").strip()
-        return float(value)
+
+        number = float(value)
+
+        if not math.isfinite(number):
+            return default
+
+        return number
+
     except (TypeError, ValueError):
         return default
 
@@ -79,21 +91,34 @@ def calculate_outcome(direction, entry_price, exit_price):
     if direction == "CALL":
         if exit_price > entry_price:
             return "WIN"
+
         if exit_price < entry_price:
             return "LOSS"
+
         return "DRAW"
 
     if direction == "PUT":
         if exit_price < entry_price:
             return "WIN"
+
         if exit_price > entry_price:
             return "LOSS"
+
         return "DRAW"
 
     return "DRAW"
 
 
+# --------------------------------------------------
+# CANDLE VALIDATION AND TIME NORMALIZATION
+# --------------------------------------------------
+
 def valid_market_candles(candles):
+    """
+    Validate OHLC values while preserving candle timestamps.
+    Timestamps passed here must already be normalized to UTC.
+    """
+
     result = []
 
     if not isinstance(candles, list):
@@ -104,29 +129,156 @@ def valid_market_candles(candles):
             continue
 
         try:
-            o = float(candle["open"])
-            h = float(candle["high"])
-            l = float(candle["low"])
-            c = float(candle["close"])
+            o = parse_number(candle.get("open"), None)
+            h = parse_number(candle.get("high"), None)
+            l = parse_number(candle.get("low"), None)
+            c = parse_number(candle.get("close"), None)
+
+            if None in (o, h, l, c):
+                continue
 
             if min(o, h, l, c) <= 0:
                 continue
 
-            if h < max(o, c, l) or l > min(o, c, h):
+            if h < max(o, c, l):
                 continue
 
-            result.append({
+            if l > min(o, c, h):
+                continue
+
+            normalized = {
                 "open": o,
                 "high": h,
                 "low": l,
                 "close": c
-            })
+            }
 
-        except (KeyError, TypeError, ValueError):
+            if "time" in candle:
+                candle_time = parse_number(
+                    candle.get("time"),
+                    None
+                )
+
+                if candle_time is None or candle_time <= 0:
+                    continue
+
+                normalized["time"] = int(candle_time)
+
+            result.append(normalized)
+
+        except (TypeError, ValueError, OverflowError):
             continue
 
     return result
 
+
+def normalize_api_candles(raw_candles):
+    """
+    Convert API candle timestamps to UTC.
+
+    API timestamps are approximately 7200 seconds
+    ahead of the UTC server time.
+    """
+
+    valid = []
+
+    if not isinstance(raw_candles, list):
+        return valid
+
+    for candle in raw_candles:
+        if not isinstance(candle, dict):
+            continue
+
+        raw_time = parse_number(
+            candle.get("time"),
+            None
+        )
+
+        if raw_time is None or raw_time <= 0:
+            continue
+
+        normalized_time = int(
+            raw_time - OTC_TICK_TIME_OFFSET_SECONDS
+        )
+
+        normalized = dict(candle)
+        normalized["time"] = normalized_time
+
+        valid.append(normalized)
+
+    valid = valid_market_candles(valid)
+
+    # Sort oldest to newest.
+    valid.sort(key=lambda item: item["time"])
+
+    # Remove duplicate timestamps.
+    unique = {}
+    for candle in valid:
+        unique[candle["time"]] = candle
+
+    return [
+        unique[timestamp]
+        for timestamp in sorted(unique)
+    ]
+
+
+def has_recent_contiguous_candles(
+    candles,
+    minimum=MIN_CANDLES_1M
+):
+    """
+    Verify that the most recent candles form a continuous
+    one-minute sequence without missing timestamps.
+    """
+
+    if len(candles) < minimum:
+        return False
+
+    recent = candles[-minimum:]
+
+    for index in range(1, len(recent)):
+        previous_time = recent[index - 1].get("time")
+        current_time = recent[index].get("time")
+
+        if previous_time is None or current_time is None:
+            return False
+
+        if current_time - previous_time != 60:
+            return False
+
+    return True
+
+
+def get_last_candle_time(candles):
+    if not candles:
+        return None
+
+    return candles[-1].get("time")
+
+
+def add_candle(candles, candle):
+    candle_time = candle.get("time")
+
+    if candle_time is not None:
+        # Do not add duplicate or older candles.
+        for existing in reversed(candles[-5:]):
+            if existing.get("time") == candle_time:
+                return
+
+        last_time = get_last_candle_time(candles)
+
+        if last_time is not None and candle_time < last_time:
+            return
+
+    candles.append(dict(candle))
+
+    if len(candles) > MAX_CANDLES:
+        del candles[:-MAX_CANDLES]
+
+
+# --------------------------------------------------
+# MARKET SCORING
+# --------------------------------------------------
 
 def market_score(candles, payout):
     candles = valid_market_candles(candles)
@@ -165,11 +317,13 @@ def market_score(candles, payout):
         consistency = 0
 
     bullish = sum(
-        1 for c in recent if c["close"] > c["open"]
+        1 for c in recent
+        if c["close"] > c["open"]
     )
 
     bearish = sum(
-        1 for c in recent if c["close"] < c["open"]
+        1 for c in recent
+        if c["close"] < c["open"]
     )
 
     directional_candles = bullish + bearish
@@ -182,7 +336,8 @@ def market_score(candles, payout):
         trend_score = 0
 
     average_atr = mean([
-        c["high"] - c["low"] for c in recent
+        c["high"] - c["low"]
+        for c in recent
     ])
 
     tolerance = max(
@@ -199,13 +354,15 @@ def market_score(candles, payout):
 
         if all(
             high >= recent[j]["high"]
-            for j in range(i - 2, i + 3) if j != i
+            for j in range(i - 2, i + 3)
+            if j != i
         ):
             pivot_highs.append(high)
 
         if all(
             low <= recent[j]["low"]
-            for j in range(i - 2, i + 3) if j != i
+            for j in range(i - 2, i + 3)
+            if j != i
         ):
             pivot_lows.append(low)
 
@@ -225,7 +382,8 @@ def market_score(candles, payout):
                 groups.append([level])
 
         return sum(
-            1 for group in groups if len(group) >= 2
+            1 for group in groups
+            if len(group) >= 2
         )
 
     level_groups = (
@@ -234,14 +392,19 @@ def market_score(candles, payout):
     )
 
     support_resistance_score = min(
-        100, level_groups * 20
+        100,
+        level_groups * 20
     )
 
     data_score = min(
-        100, len(candles) / HISTORY_1M * 100
+        100,
+        len(candles) / HISTORY_1M * 100
     )
 
-    payout_score = max(0, min(100, payout))
+    payout_score = max(
+        0,
+        min(100, payout)
+    )
 
     final_score = (
         volatility_score * 0.25
@@ -254,6 +417,10 @@ def market_score(candles, payout):
 
     return round(final_score, 2)
 
+
+# --------------------------------------------------
+# MARKET SELECTION
+# --------------------------------------------------
 
 def rank_otc_markets(current_symbols=None):
     current_symbols = current_symbols or []
@@ -272,7 +439,9 @@ def rank_otc_markets(current_symbols=None):
     ]
 
     open_symbols.sort(
-        key=lambda item: parse_number(item.get("payout")),
+        key=lambda item: parse_number(
+            item.get("payout")
+        ),
         reverse=True
     )
 
@@ -280,7 +449,8 @@ def rank_otc_markets(current_symbols=None):
     seen = set()
 
     by_symbol = {
-        item["symbol"]: item for item in open_symbols
+        item["symbol"]: item
+        for item in open_symbols
     }
 
     for symbol in current_symbols:
@@ -303,27 +473,48 @@ def rank_otc_markets(current_symbols=None):
     ranked = []
     histories = {}
 
+    # Exclude the currently forming minute candle.
+    current_bucket = int(time.time() // 60) * 60
+
     for item in candidates:
         symbol = item["symbol"]
 
         try:
-            candles = fetch_candles(
+            raw_candles = fetch_candles(
                 symbol,
                 60,
                 HISTORY_1M
             )
 
-            candles = valid_market_candles(candles)
+            candles = normalize_api_candles(
+                raw_candles
+            )
 
-            if len(candles) < MIN_CANDLES_1M:
-                logger.info(
-                    "Market skipped: %s | insufficient candles",
+            # Keep completed candles only.
+            candles = [
+                candle for candle in candles
+                if candle["time"] < current_bucket
+            ]
+
+            if not has_recent_contiguous_candles(
+                candles,
+                MIN_CANDLES_1M
+            ):
+                logger.warning(
+                    "Market skipped: %s | "
+                    "insufficient or discontinuous candle history",
                     symbol
                 )
                 continue
 
-            payout = parse_number(item.get("payout"))
-            score = market_score(candles, payout)
+            payout = parse_number(
+                item.get("payout")
+            )
+
+            score = market_score(
+                candles,
+                payout
+            )
 
             if score <= 0:
                 continue
@@ -350,6 +541,92 @@ def rank_otc_markets(current_symbols=None):
     return ranked[:MAX_SYMBOLS], histories
 
 
+# --------------------------------------------------
+# HISTORY RESYNCHRONIZATION
+# --------------------------------------------------
+
+def fetch_resynchronized_history(
+    symbol,
+    current_bucket
+):
+    """
+    Reload recent completed candles from the API.
+
+    The latest expected completed candle must be:
+        current_bucket - 60
+
+    The most recent 200 candles must be continuous.
+    """
+
+    try:
+        raw_candles = fetch_candles(
+            symbol,
+            60,
+            HISTORY_1M
+        )
+
+        candles = normalize_api_candles(
+            raw_candles
+        )
+
+        candles = [
+            candle for candle in candles
+            if candle["time"] < current_bucket
+        ]
+
+        if not candles:
+            logger.warning(
+                "RESYNC FAILED: %s | API returned no completed candles",
+                symbol
+            )
+            return None
+
+        expected_last_time = current_bucket - 60
+        actual_last_time = get_last_candle_time(candles)
+
+        if actual_last_time != expected_last_time:
+            logger.warning(
+                "RESYNC FAILED: %s | "
+                "expected latest=%s | actual latest=%s",
+                symbol,
+                expected_last_time,
+                actual_last_time
+            )
+            return None
+
+        if not has_recent_contiguous_candles(
+            candles,
+            MIN_CANDLES_1M
+        ):
+            logger.warning(
+                "RESYNC FAILED: %s | "
+                "recent candles are not continuous",
+                symbol
+            )
+            return None
+
+        logger.info(
+            "RESYNC SUCCESS: %s | candles=%s | "
+            "latest=%s",
+            symbol,
+            len(candles),
+            actual_last_time
+        )
+
+        return candles[-MAX_CANDLES:]
+
+    except Exception:
+        logger.exception(
+            "RESYNC ERROR: %s",
+            symbol
+        )
+        return None
+
+
+# --------------------------------------------------
+# LIVE STREAM
+# --------------------------------------------------
+
 def stream_worker(symbols, tick_queue, stop_event):
     while not stop_event.is_set():
         try:
@@ -369,26 +646,37 @@ def stream_worker(symbols, tick_queue, stop_event):
                     tick_queue.put(event)
 
                 elif event.get("_event") == "closed":
-                    logger.warning("OTC stream closed")
+                    logger.warning(
+                        "OTC stream closed"
+                    )
                     break
 
         except Exception:
-            logger.exception("OTC stream error")
+            logger.exception(
+                "OTC stream error"
+            )
 
         if not stop_event.is_set():
             time.sleep(5)
 
 
-def add_candle(candles, candle):
-    candles.append(candle)
+# --------------------------------------------------
+# SIGNAL VALIDATION
+# --------------------------------------------------
 
-    if len(candles) > MAX_CANDLES:
-        del candles[:-MAX_CANDLES]
-
-
-def validate_pending_signal(alert, price, candles_1m):
+def validate_pending_signal(
+    alert,
+    price,
+    candles_1m
+):
     if len(candles_1m) < MIN_CANDLES_1M:
         return False, "بيانات الدقيقة غير كافية"
+
+    if not has_recent_contiguous_candles(
+        candles_1m,
+        MIN_CANDLES_1M
+    ):
+        return False, "تسلسل بيانات الدقيقة غير مكتمل"
 
     original = alert["signal"]
     direction = original.get("direction")
@@ -418,13 +706,16 @@ def validate_pending_signal(alert, price, candles_1m):
         return False, "الاستراتيجية لم تعد تؤكد الإشارة"
 
     original_price = parse_number(
-        original.get("price"), price
+        original.get("price"),
+        price
     )
 
     if original_price <= 0:
         return False, "سعر الإشارة غير صالح"
 
-    movement = abs(price - original_price) / original_price
+    movement = abs(
+        price - original_price
+    ) / original_price
 
     if movement > 0.002:
         return False, "تحرك السعر بعيداً عن نقطة الإشارة"
@@ -432,28 +723,38 @@ def validate_pending_signal(alert, price, candles_1m):
     return True, "تم تأكيد الإشارة"
 
 
+# --------------------------------------------------
+# MAIN SCANNER
+# --------------------------------------------------
+
 async def scanner_loop(send_signal, send_result):
     logger.info("OTC Smart Analyzer starting")
     logger.info("Analysis timeframe: 1m only")
     logger.info("Dynamic market selection enabled")
     logger.info("Trade history recording enabled")
+
     logger.info(
         "Dual-duration comparison enabled: %s seconds",
         COMPARISON_DURATIONS
     )
+
     logger.info("Dynamic duration selection enabled")
+
     logger.info(
         "Market refresh interval: %s seconds",
         MARKET_REFRESH_SECONDS
     )
+
     logger.info(
         "1m candle history target: %s",
         HISTORY_1M
     )
+
     logger.info(
-        "OTC tick timestamp correction: -%s seconds",
+        "OTC candle and tick timestamp correction: -%s seconds",
         OTC_TICK_TIME_OFFSET_SECONDS
     )
+
     logger.info(
         "Display timezone: Europe/Nicosia"
     )
@@ -464,10 +765,15 @@ async def scanner_loop(send_signal, send_result):
     )
 
     if not selected:
-        logger.error("No suitable OTC markets found")
+        logger.error(
+            "No suitable OTC markets found"
+        )
         return
 
-    symbols = [item["symbol"] for item in selected]
+    symbols = [
+        item["symbol"]
+        for item in selected
+    ]
 
     logger.info(
         "Selected OTC markets: %s",
@@ -484,11 +790,21 @@ async def scanner_loop(send_signal, send_result):
 
     current_1m = {}
 
+    # Each market has its own data-integrity state.
+    data_ready = {
+        symbol: has_recent_contiguous_candles(
+            candles_1m[symbol],
+            MIN_CANDLES_1M
+        )
+        for symbol in symbols
+    }
+
     for symbol in symbols:
         logger.info(
-            "History loaded: %s | 1m=%s",
+            "History loaded: %s | 1m=%s | ready=%s",
             symbol,
-            len(candles_1m[symbol])
+            len(candles_1m[symbol]),
+            data_ready[symbol]
         )
 
     tick_queue = queue.Queue()
@@ -499,6 +815,7 @@ async def scanner_loop(send_signal, send_result):
         args=(symbols, tick_queue, stop_event),
         daemon=True
     )
+
     worker.start()
 
     pending_alerts = {}
@@ -506,7 +823,10 @@ async def scanner_loop(send_signal, send_result):
     last_signal_time = {}
 
     pending_selection = None
-    next_refresh = time.monotonic() + MARKET_REFRESH_SECONDS
+
+    next_refresh = (
+        time.monotonic() + MARKET_REFRESH_SECONDS
+    )
 
     async def cancel_alert(symbol, alert, reason):
         message = dict(alert["signal"])
@@ -521,6 +841,7 @@ async def scanner_loop(send_signal, send_result):
 
         try:
             await send_signal(message)
+
         except Exception:
             logger.exception(
                 "Cancellation message failed for %s",
@@ -535,12 +856,21 @@ async def scanner_loop(send_signal, send_result):
 
         pending_alerts.pop(symbol, None)
 
-    async def apply_selection(new_selection, new_histories):
-        nonlocal symbols, tick_queue, stop_event, worker
-        nonlocal candles_1m, current_1m
+    async def apply_selection(
+        new_selection,
+        new_histories
+    ):
+        nonlocal symbols
+        nonlocal tick_queue
+        nonlocal stop_event
+        nonlocal worker
+        nonlocal candles_1m
+        nonlocal current_1m
+        nonlocal data_ready
 
         new_symbols = [
-            item["symbol"] for item in new_selection
+            item["symbol"]
+            for item in new_selection
         ]
 
         if not new_symbols:
@@ -563,7 +893,11 @@ async def scanner_loop(send_signal, send_result):
         )
 
         stop_event.set()
-        await asyncio.to_thread(worker.join, 8)
+
+        await asyncio.to_thread(
+            worker.join,
+            8
+        )
 
         if worker.is_alive():
             logger.warning(
@@ -579,7 +913,16 @@ async def scanner_loop(send_signal, send_result):
             for symbol in symbols
         }
 
+        data_ready = {
+            symbol: has_recent_contiguous_candles(
+                candles_1m[symbol],
+                MIN_CANDLES_1M
+            )
+            for symbol in symbols
+        }
+
         current_1m = {}
+
         tick_queue = queue.Queue()
         stop_event = threading.Event()
 
@@ -588,6 +931,7 @@ async def scanner_loop(send_signal, send_result):
             args=(symbols, tick_queue, stop_event),
             daemon=True
         )
+
         worker.start()
 
         logger.info(
@@ -602,17 +946,24 @@ async def scanner_loop(send_signal, send_result):
 
     try:
         while True:
+
+            # --------------------------------------
+            # PERIODIC MARKET REFRESH
+            # --------------------------------------
+
             if time.monotonic() >= next_refresh:
                 next_refresh = (
-                    time.monotonic() + MARKET_REFRESH_SECONDS
+                    time.monotonic()
+                    + MARKET_REFRESH_SECONDS
                 )
 
                 try:
-                    new_selection, new_histories = (
-                        await asyncio.to_thread(
-                            rank_otc_markets,
-                            symbols
-                        )
+                    (
+                        new_selection,
+                        new_histories
+                    ) = await asyncio.to_thread(
+                        rank_otc_markets,
+                        symbols
                     )
 
                     if new_selection:
@@ -626,6 +977,7 @@ async def scanner_loop(send_signal, send_result):
                                 "Market rotation postponed: "
                                 "active alerts or trades"
                             )
+
                         else:
                             applied = await apply_selection(
                                 new_selection,
@@ -640,7 +992,8 @@ async def scanner_loop(send_signal, send_result):
 
                     else:
                         logger.warning(
-                            "Market refresh returned no suitable markets"
+                            "Market refresh returned "
+                            "no suitable markets"
                         )
 
                 except Exception:
@@ -648,12 +1001,19 @@ async def scanner_loop(send_signal, send_result):
                         "Dynamic market refresh failed"
                     )
 
+            # --------------------------------------
+            # APPLY POSTPONED MARKET SELECTION
+            # --------------------------------------
+
             if (
                 pending_selection
                 and not pending_alerts
                 and not pending_trades
             ):
-                new_selection, new_histories = pending_selection
+                (
+                    new_selection,
+                    new_histories
+                ) = pending_selection
 
                 applied = await apply_selection(
                     new_selection,
@@ -663,12 +1023,17 @@ async def scanner_loop(send_signal, send_result):
                 if applied:
                     pending_selection = None
 
+            # --------------------------------------
+            # RECEIVE LIVE TICK
+            # --------------------------------------
+
             try:
                 tick = await asyncio.to_thread(
                     tick_queue.get,
                     True,
                     1
                 )
+
             except queue.Empty:
                 continue
 
@@ -678,30 +1043,45 @@ async def scanner_loop(send_signal, send_result):
                 if symbol not in symbols:
                     continue
 
-                price = parse_number(tick.get("price"))
-                raw_timestamp = parse_number(tick.get("time"))
+                price = parse_number(
+                    tick.get("price")
+                )
+
+                raw_timestamp = parse_number(
+                    tick.get("time")
+                )
 
                 if price <= 0 or raw_timestamp <= 0:
                     continue
 
-                # Correct the OTC stream timestamp to UTC.
+                # Normalize stream timestamp to UTC.
                 timestamp = (
-                    raw_timestamp - OTC_TICK_TIME_OFFSET_SECONDS
+                    raw_timestamp
+                    - OTC_TICK_TIME_OFFSET_SECONDS
                 )
 
                 if timestamp <= 0:
                     continue
 
-                minute_bucket = int(timestamp // 60) * 60
+                minute_bucket = (
+                    int(timestamp // 60) * 60
+                )
+
+                # ----------------------------------
+                # PAPER TRADE RESULT PROCESSING
+                # ----------------------------------
 
                 trade = pending_trades.get(symbol)
 
                 if trade:
                     for horizon in COMPARISON_DURATIONS:
+
                         if horizon in trade["processed_horizons"]:
                             continue
 
-                        target_time = trade["entry_time"] + horizon
+                        target_time = (
+                            trade["entry_time"] + horizon
+                        )
 
                         if timestamp < target_time:
                             continue
@@ -721,14 +1101,17 @@ async def scanner_loop(send_signal, send_result):
                             )
 
                             logger.warning(
-                                "HORIZON RESULT MISSED: %s | %ss | "
-                                "tick delayed by %ss",
+                                "HORIZON RESULT MISSED: %s | "
+                                "%ss | tick delayed by %ss",
                                 symbol,
                                 horizon,
                                 delay
                             )
 
-                            trade["processed_horizons"].add(horizon)
+                            trade["processed_horizons"].add(
+                                horizon
+                            )
+
                             continue
 
                         outcome = calculate_outcome(
@@ -740,9 +1123,13 @@ async def scanner_loop(send_signal, send_result):
                         horizon_details = {
                             "symbol": symbol,
                             "direction": trade["direction"],
-                            "strategies": trade.get("strategies", []),
+                            "strategies": trade.get(
+                                "strategies",
+                                []
+                            ),
                             "strategy_reasons": trade.get(
-                                "strategy_reasons", []
+                                "strategy_reasons",
+                                []
                             ),
                             "entry_time": trade["entry_time"],
                             "target_time": target_time,
@@ -763,9 +1150,11 @@ async def scanner_loop(send_signal, send_result):
                             details=horizon_details
                         )
 
-                        trade["processed_horizons"].add(horizon)
-
                         if saved:
+                            trade["processed_horizons"].add(
+                                horizon
+                            )
+
                             logger.info(
                                 "HORIZON RESULT: %s | %ss | %s | "
                                 "entry=%s | exit=%s",
@@ -776,8 +1165,20 @@ async def scanner_loop(send_signal, send_result):
                                 price
                             )
 
-                        # The selected horizon becomes the primary result.
-                        if horizon == trade["selected_duration_seconds"]:
+                        else:
+                            logger.error(
+                                "HORIZON RESULT SAVE FAILED: %s | %ss",
+                                symbol,
+                                horizon
+                            )
+
+                        # Selected horizon is the primary result.
+                        if (
+                            horizon
+                            == trade["selected_duration_seconds"]
+                            and saved
+                            and not trade.get("primary_result_saved")
+                        ):
                             result_data = {
                                 "symbol": symbol,
                                 "direction": trade["direction"],
@@ -786,19 +1187,26 @@ async def scanner_loop(send_signal, send_result):
                                 "entry_time": format_time(
                                     trade["entry_time"]
                                 ),
-                                "exit_time": format_time(timestamp),
+                                "exit_time": format_time(
+                                    timestamp
+                                ),
                                 "result": outcome,
                                 "duration_seconds": horizon,
                                 "duration_reason": trade.get(
-                                    "duration_reason", ""
+                                    "duration_reason",
+                                    ""
                                 ),
-                                "strategies": trade.get("strategies", []),
+                                "strategies": trade.get(
+                                    "strategies",
+                                    []
+                                ),
                                 "strategy_reasons": trade.get(
-                                    "strategy_reasons", []
+                                    "strategy_reasons",
+                                    []
                                 )
                             }
 
-                            record_result(
+                            primary_saved = record_result(
                                 trade.get("history_id"),
                                 outcome,
                                 entry_price=trade["entry_price"],
@@ -806,23 +1214,34 @@ async def scanner_loop(send_signal, send_result):
                                 details=horizon_details
                             )
 
-                            try:
-                                await send_result(result_data)
-                            except Exception:
-                                logger.exception(
-                                    "Selected-duration result delivery failed: %s",
-                                    symbol
+                            if primary_saved:
+                                trade["primary_result_saved"] = True
+
+                                try:
+                                    await send_result(result_data)
+
+                                except Exception:
+                                    logger.exception(
+                                        "Selected-duration result "
+                                        "delivery failed: %s",
+                                        symbol
+                                    )
+
+                                logger.info(
+                                    "PAPER RESULT %ss: %s | %s | %s | "
+                                    "Strategies=%s",
+                                    horizon,
+                                    symbol,
+                                    trade["direction"],
+                                    outcome,
+                                    trade.get("strategies", [])
                                 )
 
-                            logger.info(
-                                "PAPER RESULT %ss: %s | %s | %s | "
-                                "Strategies=%s",
-                                horizon,
-                                symbol,
-                                trade["direction"],
-                                outcome,
-                                trade.get("strategies", [])
-                            )
+                            else:
+                                logger.error(
+                                    "PRIMARY RESULT SAVE FAILED: %s",
+                                    symbol
+                                )
 
                     if all(
                         horizon in trade["processed_horizons"]
@@ -832,7 +1251,9 @@ async def scanner_loop(send_signal, send_result):
                             trade.get("history_id"),
                             "DURATION_COMPARISON_COMPLETED",
                             {
-                                "durations": list(COMPARISON_DURATIONS),
+                                "durations": list(
+                                    COMPARISON_DURATIONS
+                                ),
                                 "selected_duration_seconds": trade[
                                     "selected_duration_seconds"
                                 ]
@@ -844,38 +1265,157 @@ async def scanner_loop(send_signal, send_result):
                             symbol
                         )
 
-                        pending_trades.pop(symbol, None)
+                        pending_trades.pop(
+                            symbol,
+                            None
+                        )
+
+                # ----------------------------------
+                # BUILD LIVE ONE-MINUTE CANDLES
+                # ----------------------------------
 
                 candle = current_1m.get(symbol)
 
                 if candle is None:
+                    # The first live candle must follow the
+                    # latest completed historical candle.
+                    last_history_time = get_last_candle_time(
+                        candles_1m[symbol]
+                    )
+
+                    expected_previous_time = (
+                        minute_bucket - 60
+                    )
+
+                    if last_history_time != expected_previous_time:
+                        logger.warning(
+                            "INITIAL DATA ALIGNMENT NEEDED: %s | "
+                            "expected=%s | actual=%s",
+                            symbol,
+                            expected_previous_time,
+                            last_history_time
+                        )
+
+                        recovered = await asyncio.to_thread(
+                            fetch_resynchronized_history,
+                            symbol,
+                            minute_bucket
+                        )
+
+                        if recovered is not None:
+                            candles_1m[symbol] = recovered
+                            data_ready[symbol] = True
+
+                        else:
+                            data_ready[symbol] = False
+
                     current_1m[symbol] = {
+                        "time": minute_bucket,
                         "bucket": minute_bucket,
                         "open": price,
                         "high": price,
                         "low": price,
                         "close": price
                     }
+
                     continue
 
                 if minute_bucket == candle["bucket"]:
-                    candle["high"] = max(candle["high"], price)
-                    candle["low"] = min(candle["low"], price)
+                    candle["high"] = max(
+                        candle["high"],
+                        price
+                    )
+
+                    candle["low"] = min(
+                        candle["low"],
+                        price
+                    )
+
                     candle["close"] = price
 
                 elif minute_bucket > candle["bucket"]:
-                    if minute_bucket - candle["bucket"] == 60:
-                        add_candle(
-                            candles_1m[symbol],
-                            dict(candle)
-                        )
-                    else:
-                        logger.warning(
-                            "Missing 1m candle: %s",
-                            symbol
+
+                    gap_seconds = (
+                        minute_bucket - candle["bucket"]
+                    )
+
+                    if gap_seconds == 60 and data_ready.get(symbol, False):
+
+                        expected_previous_history = (
+                            candle["bucket"] - 60
                         )
 
+                        actual_previous_history = (
+                            get_last_candle_time(
+                                candles_1m[symbol]
+                            )
+                        )
+
+                        if (
+                            actual_previous_history
+                            == expected_previous_history
+                        ):
+                            completed_candle = dict(candle)
+                            completed_candle["time"] = candle["bucket"]
+
+                            add_candle(
+                                candles_1m[symbol],
+                                completed_candle
+                            )
+
+                        else:
+                            logger.warning(
+                                "CANDLE SEQUENCE MISMATCH: %s | "
+                                "history=%s | expected=%s",
+                                symbol,
+                                actual_previous_history,
+                                expected_previous_history
+                            )
+
+                            data_ready[symbol] = False
+
+                    else:
+                        missing_minutes = (
+                            gap_seconds // 60
+                        ) - 1
+
+                        logger.warning(
+                            "CANDLE GAP DETECTED: %s | "
+                            "gap=%ss | missing_minutes=%s",
+                            symbol,
+                            gap_seconds,
+                            missing_minutes
+                        )
+
+                        data_ready[symbol] = False
+
+                    # Any gap or sequence mismatch requires
+                    # a complete API resynchronization.
+                    if not data_ready.get(symbol, False):
+                        recovered = await asyncio.to_thread(
+                            fetch_resynchronized_history,
+                            symbol,
+                            minute_bucket
+                        )
+
+                        if recovered is not None:
+                            candles_1m[symbol] = recovered
+                            data_ready[symbol] = True
+
+                            logger.info(
+                                "MARKET DATA RESTORED: %s",
+                                symbol
+                            )
+
+                        else:
+                            logger.warning(
+                                "MARKET DATA NOT READY: %s | "
+                                "signals temporarily disabled",
+                                symbol
+                            )
+
                     current_1m[symbol] = {
+                        "time": minute_bucket,
                         "bucket": minute_bucket,
                         "open": price,
                         "high": price,
@@ -884,20 +1424,35 @@ async def scanner_loop(send_signal, send_result):
                     }
 
                 else:
+                    # Ignore old or out-of-order ticks.
                     continue
+
+                # ----------------------------------
+                # PENDING ALERT CONFIRMATION
+                # ----------------------------------
 
                 alert = pending_alerts.get(symbol)
 
                 if alert:
+
                     if (
                         alert["status"] == "WAIT_CONFIRM"
                         and timestamp >= alert["confirm_at"]
                     ):
+
                         if timestamp >= alert["entry_at"]:
                             await cancel_alert(
                                 symbol,
                                 alert,
                                 "وصل وقت الدخول قبل اكتمال التأكيد"
+                            )
+                            continue
+
+                        if not data_ready.get(symbol, False):
+                            await cancel_alert(
+                                symbol,
+                                alert,
+                                "بيانات السوق غير مكتملة"
                             )
                             continue
 
@@ -910,29 +1465,39 @@ async def scanner_loop(send_signal, send_result):
                         if valid:
                             message = dict(alert["signal"])
                             message["status"] = "ENTRY"
+
                             message["entry_time"] = format_time(
                                 alert["entry_at"]
                             )
+
                             message["duration_seconds"] = alert[
                                 "selected_duration_seconds"
                             ]
+
                             message["selected_duration_seconds"] = alert[
                                 "selected_duration_seconds"
                             ]
+
                             message["duration_reason"] = alert[
                                 "duration_reason"
                             ]
+
                             message["exit_time"] = format_time(
                                 alert["entry_at"]
                                 + alert["selected_duration_seconds"]
                             )
+
                             message["comparison_durations"] = list(
                                 COMPARISON_DURATIONS
                             )
+
                             message["confirmation"] = reason
 
                             try:
-                                delivered = await send_signal(message)
+                                delivered = await send_signal(
+                                    message
+                                )
+
                             except Exception:
                                 logger.exception(
                                     "Entry confirmation delivery failed: %s",
@@ -945,13 +1510,18 @@ async def scanner_loop(send_signal, send_result):
                                     alert.get("history_id"),
                                     "ENTRY_NOT_DELIVERED"
                                 )
-                                pending_alerts.pop(symbol, None)
+
+                                pending_alerts.pop(
+                                    symbol,
+                                    None
+                                )
 
                                 logger.warning(
                                     "ENTRY CONFIRMATION NOT DELIVERED; "
                                     "PAPER TRADE BLOCKED: %s",
                                     symbol
                                 )
+
                                 continue
 
                             alert["status"] = "CONFIRMED"
@@ -962,7 +1532,9 @@ async def scanner_loop(send_signal, send_result):
                                 {
                                     "confirmation": reason,
                                     "confirmation_price": price,
-                                    "planned_entry_time": alert["entry_at"],
+                                    "planned_entry_time": alert[
+                                        "entry_at"
+                                    ],
                                     "selected_duration_seconds": alert[
                                         "selected_duration_seconds"
                                     ],
@@ -986,14 +1558,22 @@ async def scanner_loop(send_signal, send_result):
                                 alert,
                                 reason
                             )
+
                             continue
+
+                    # ----------------------------------
+                    # START PAPER TRADE
+                    # ----------------------------------
 
                     if (
                         alert
                         and alert["status"] == "CONFIRMED"
                         and timestamp >= alert["entry_at"]
                     ):
-                        delay = timestamp - alert["entry_at"]
+
+                        delay = (
+                            timestamp - alert["entry_at"]
+                        )
 
                         if delay > MAX_ENTRY_DELAY:
                             await cancel_alert(
@@ -1012,6 +1592,7 @@ async def scanner_loop(send_signal, send_result):
                             continue
 
                         signal = alert["signal"]
+
                         selected_duration = alert[
                             "selected_duration_seconds"
                         ]
@@ -1022,15 +1603,22 @@ async def scanner_loop(send_signal, send_result):
                             "entry_price": price,
                             "entry_time": timestamp,
                             "strategies": list(
-                                signal.get("matching_strategies", [])
+                                signal.get(
+                                    "matching_strategies",
+                                    []
+                                )
                             ),
                             "strategy_reasons": list(
-                                signal.get("strategy_reasons", [])
+                                signal.get(
+                                    "strategy_reasons",
+                                    []
+                                )
                             ),
                             "history_id": alert.get("history_id"),
                             "selected_duration_seconds": selected_duration,
                             "duration_reason": alert["duration_reason"],
-                            "processed_horizons": set()
+                            "processed_horizons": set(),
+                            "primary_result_saved": False
                         }
 
                         record_update(
@@ -1049,15 +1637,24 @@ async def scanner_loop(send_signal, send_result):
 
                         logger.info(
                             "PAPER TRADE STARTED: %s | %s | "
-                            "Entry=%s | Selected=%ss | Comparison=60s/120s",
+                            "Entry=%s | Selected=%ss | "
+                            "Comparison=60s/120s",
                             symbol,
                             signal["direction"],
                             price,
                             selected_duration
                         )
 
-                        pending_alerts.pop(symbol, None)
+                        pending_alerts.pop(
+                            symbol,
+                            None
+                        )
+
                         continue
+
+                # ----------------------------------
+                # DO NOT ANALYZE DURING OPEN TRADE
+                # ----------------------------------
 
                 if symbol in pending_trades:
                     continue
@@ -1065,8 +1662,33 @@ async def scanner_loop(send_signal, send_result):
                 if symbol in pending_alerts:
                     continue
 
+                # ----------------------------------
+                # DATA INTEGRITY CHECK BEFORE ANALYSIS
+                # ----------------------------------
+
+                if not data_ready.get(symbol, False):
+                    continue
+
                 if len(candles_1m[symbol]) < MIN_CANDLES_1M:
                     continue
+
+                if not has_recent_contiguous_candles(
+                    candles_1m[symbol],
+                    MIN_CANDLES_1M
+                ):
+                    data_ready[symbol] = False
+
+                    logger.warning(
+                        "ANALYSIS BLOCKED: %s | "
+                        "recent candle sequence is not continuous",
+                        symbol
+                    )
+
+                    continue
+
+                # ----------------------------------
+                # SIGNAL ANALYSIS
+                # ----------------------------------
 
                 signal = analyze_signal(
                     candles_1m[symbol],
@@ -1079,7 +1701,10 @@ async def scanner_loop(send_signal, send_result):
                 if not is_new_signal(signal):
                     continue
 
-                previous_time = last_signal_time.get(symbol, 0)
+                previous_time = last_signal_time.get(
+                    symbol,
+                    0
+                )
 
                 if timestamp - previous_time < 60:
                     continue
@@ -1089,23 +1714,38 @@ async def scanner_loop(send_signal, send_result):
                 signal["analysis_timeframe"] = "1m"
                 signal["status"] = "PRE_ALERT"
 
-                # Use the duration selector from signal_engine.py.
-                selected_duration, duration_reason = (
-                    select_trade_duration(signal)
+                # Duration is selected once here.
+                (
+                    selected_duration,
+                    duration_reason
+                ) = select_trade_duration(signal)
+
+                signal["selected_duration_seconds"] = (
+                    selected_duration
                 )
 
-                signal["selected_duration_seconds"] = selected_duration
-                signal["duration_seconds"] = selected_duration
-                signal["duration_reason"] = duration_reason
-                signal["expiry_minutes"] = selected_duration // 60
+                signal["duration_seconds"] = (
+                    selected_duration
+                )
 
-                # Keep the agreed entry schedule unchanged.
-                earliest_entry = timestamp + PRE_ENTRY_SECONDS
+                signal["duration_reason"] = duration_reason
+
+                signal["expiry_minutes"] = (
+                    selected_duration // 60
+                )
+
+                # Keep the existing entry schedule unchanged.
+                earliest_entry = (
+                    timestamp + PRE_ENTRY_SECONDS
+                )
+
                 entry_at = (
                     (int(earliest_entry) + 59) // 60
                 ) * 60
 
-                confirm_at = entry_at - CONFIRM_BEFORE_ENTRY
+                confirm_at = (
+                    entry_at - CONFIRM_BEFORE_ENTRY
+                )
 
                 alert = {
                     "signal": signal,
@@ -1131,22 +1771,42 @@ async def scanner_loop(send_signal, send_result):
                 )
 
                 message = dict(signal)
-                message["entry_time"] = format_time(entry_at)
-                message["confirm_time"] = format_time(confirm_at)
-                message["duration_seconds"] = selected_duration
-                message["selected_duration_seconds"] = selected_duration
-                message["duration_reason"] = duration_reason
+
+                message["entry_time"] = format_time(
+                    entry_at
+                )
+
+                message["confirm_time"] = format_time(
+                    confirm_at
+                )
+
+                message["duration_seconds"] = (
+                    selected_duration
+                )
+
+                message["selected_duration_seconds"] = (
+                    selected_duration
+                )
+
+                message["duration_reason"] = (
+                    duration_reason
+                )
+
                 message["exit_time"] = format_time(
                     entry_at + selected_duration
                 )
 
                 try:
-                    delivered = await send_signal(message)
+                    delivered = await send_signal(
+                        message
+                    )
+
                 except Exception:
                     logger.exception(
                         "Pre-alert delivery failed for %s",
                         symbol
                     )
+
                     delivered = False
 
                 if not delivered:
@@ -1155,9 +1815,11 @@ async def scanner_loop(send_signal, send_result):
                         "SIGNAL DISCARDED: %s",
                         symbol
                     )
+
                     continue
 
                 history_id = record_signal(signal)
+
                 alert["history_id"] = history_id
 
                 if history_id:
@@ -1176,7 +1838,17 @@ async def scanner_loop(send_signal, send_result):
                         }
                     )
 
+                else:
+                    logger.error(
+                        "SIGNAL HISTORY NOT SAVED: %s | "
+                        "signal will not be activated",
+                        symbol
+                    )
+
+                    continue
+
                 pending_alerts[symbol] = alert
+
                 last_signal_time[symbol] = timestamp
 
                 logger.info(
@@ -1190,9 +1862,18 @@ async def scanner_loop(send_signal, send_result):
                 )
 
             except Exception:
-                logger.exception("Tick processing failed")
+                logger.exception(
+                    "Tick processing failed"
+                )
 
     finally:
         stop_event.set()
-        await asyncio.to_thread(worker.join, 5)
-        logger.info("OTC scanner stopped")
+
+        await asyncio.to_thread(
+            worker.join,
+            5
+        )
+
+        logger.info(
+            "OTC scanner stopped"
+        )
