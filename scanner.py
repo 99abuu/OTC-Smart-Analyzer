@@ -8,7 +8,12 @@ from datetime import datetime, timezone
 from statistics import mean
 
 from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
-from signal_engine import analyze_signal, is_new_signal
+
+from signal_engine import (
+    analyze_signal,
+    is_new_signal,
+    select_trade_duration
+)
 
 from trade_history import (
     record_signal,
@@ -70,77 +75,6 @@ def calculate_outcome(direction, entry_price, exit_price):
         return "DRAW"
 
     return "DRAW"
-
-
-def select_trade_duration(signal):
-    """
-    Experimental rule-based duration selection.
-    The decision is made before entry and never uses future results.
-    """
-
-    direction = str(signal.get("direction", "")).upper()
-    trend = str(signal.get("trend", "")).upper()
-
-    adx_value = parse_number(signal.get("adx"), 0)
-
-    strategies = {
-        str(name).strip().lower()
-        for name in signal.get("matching_strategies", [])
-    }
-
-    trend_aligned = (
-        (direction == "CALL" and trend == "UP")
-        or (direction == "PUT" and trend == "DOWN")
-    )
-
-    trend_strategies = {
-        "trend pullback",
-        "breakout retest"
-    }
-
-    has_trend_strategy = bool(
-        strategies.intersection(trend_strategies)
-    )
-
-    # Two minutes are selected only when the trend is aligned,
-    # ADX indicates a reasonably strong trend, and a trend-based
-    # strategy is part of the signal.
-    if (
-        trend_aligned
-        and adx_value >= 22
-        and has_trend_strategy
-    ):
-        return (
-            120,
-            "اتجاه واضح وقوة ADX مناسبة مع تحقق استراتيجية اتجاهية"
-        )
-
-    # Rejection strategies and weaker/unclear trends use 60 seconds.
-    if strategies.intersection({
-        "support rejection",
-        "resistance rejection"
-    }):
-        return (
-            60,
-            "إشارة ارتداد من دعم أو مقاومة؛ المدة التجريبية الأقصر أنسب للاختبار"
-        )
-
-    if not trend_aligned:
-        return (
-            60,
-            "الاتجاه غير متوافق بوضوح مع الإشارة؛ تم اختيار المدة الأقصر"
-        )
-
-    if adx_value < 22:
-        return (
-            60,
-            "قوة الاتجاه غير كافية لاختيار دقيقتين؛ تم اختيار 60 ثانية"
-        )
-
-    return (
-        DEFAULT_TRADE_DURATION,
-        "لا توجد خصائص كافية لتفضيل دقيقتين؛ الاختيار الافتراضي 60 ثانية"
-    )
 
 
 def valid_market_candles(candles):
@@ -1136,6 +1070,7 @@ async def scanner_loop(send_signal, send_result):
                 signal["analysis_timeframe"] = "1m"
                 signal["status"] = "PRE_ALERT"
 
+                # Use the duration selector from signal_engine.py.
                 selected_duration, duration_reason = (
                     select_trade_duration(signal)
                 )
