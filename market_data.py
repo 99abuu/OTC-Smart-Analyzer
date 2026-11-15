@@ -8,7 +8,6 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-
 logger = logging.getLogger(__name__)
 
 API_URL = "https://otcharts.com/v1/candles"
@@ -119,6 +118,37 @@ def make_request(url):
         ) from None
 
 
+def log_candle_diagnostics(symbol, candles, timeframe):
+    logger.info(
+        "CANDLE DIAGNOSTIC | symbol=%s | timeframe=%s | "
+        "count=%s",
+        symbol,
+        timeframe,
+        len(candles)
+    )
+
+    for index, candle in enumerate(candles[:2]):
+        logger.info(
+            "RAW CANDLE SAMPLE | symbol=%s | index=%s | data=%s",
+            symbol,
+            index,
+            json.dumps(
+                candle,
+                ensure_ascii=False,
+                default=str
+            )
+        )
+
+    if len(candles) >= 2:
+        logger.info(
+            "CANDLE ORDER SAMPLE | symbol=%s | "
+            "first=%s | last=%s",
+            symbol,
+            json.dumps(candles[0], ensure_ascii=False, default=str),
+            json.dumps(candles[-1], ensure_ascii=False, default=str)
+        )
+
+
 def fetch_candles(
     symbol="EURUSD_otc",
     timeframe=60,
@@ -152,6 +182,14 @@ def fetch_candles(
         raise RuntimeError(
             "No candles returned by OTCharts"
         )
+
+    # Temporary diagnostics:
+    # Inspect the raw candle structure and timestamp fields.
+    log_candle_diagnostics(
+        symbol,
+        candles,
+        timeframe
+    )
 
     invalid_count = 0
 
@@ -358,7 +396,6 @@ def stream_ticks(symbols):
 
                     continue
 
-                # SSE comment / heartbeat
                 if line.startswith(":"):
                     continue
 
@@ -370,11 +407,8 @@ def stream_ticks(symbols):
                         line[5:].lstrip()
                     )
 
-                # Ignore other SSE fields:
-                # id:, retry:, etc.
-
-            # Process the final event if the connection
-            # closes without an empty line separator.
+            # Process the last event if the stream closes
+            # without an empty-line separator.
             if data_lines:
                 payload = process_event()
 
