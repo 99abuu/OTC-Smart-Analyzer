@@ -120,11 +120,7 @@ def build_stats_message(data):
     completed = wins + losses + draws
     decisive = wins + losses
 
-    win_rate = (
-        wins / decisive * 100
-        if decisive
-        else 0
-    )
+    win_rate = wins / decisive * 100 if decisive else 0
 
     cancelled_ids = {
         signal_id
@@ -239,7 +235,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 OTC Smart Analyzer\n\n"
         "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
         "🔍 مراقبة أفضل 5 أدوات OTC\n"
-        "⏱️ تنبيه قبل الدخول بـ60 ثانية\n"
+        "⏱️ تنبيه مسبق قبل الدخول\n"
         "📊 متابعة نتائج الصفقات التجريبية\n"
         "🧠 استراتيجيات مستقلة متعددة\n"
         "📈 التحليل على فريم الدقيقة فقط\n\n"
@@ -264,9 +260,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الماسح: {'🟢 يعمل' if running else '🔴 متوقف'}\n"
         "الأدوات المستهدفة: 5\n"
         "فريم التحليل: دقيقة واحدة فقط\n"
-        "التنبيه المسبق: 60 ثانية\n"
-        f"المشتركون الحاليون: {len(subscribers)}\n"
-        "نظام التحليل: استراتيجيات مستقلة\n\n"
+        "الدخول المقترح: بداية دقيقة UTC\n"
+        "مدة الصفقة التجريبية: 60 ثانية\n"
+        "مقارنة إضافية: 120 ثانية\n"
+        f"المشتركون الحاليون: {len(subscribers)}\n\n"
         "⚠️ النتائج تجريبية فقط."
     )
 
@@ -279,12 +276,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await asyncio.to_thread(read_trade_history)
         message = build_stats_message(data)
-
         await update.message.reply_text(message)
 
     except Exception:
         logger.exception("Statistics generation failed")
-
         await update.message.reply_text(
             "❌ تعذر قراءة سجل الصفقات. راجع سجلات التشغيل."
         )
@@ -428,17 +423,18 @@ async def post_init(app):
 
     async def notify(signal):
         phase = signal_phase(signal)
-
         strategies_text = format_signal_details(signal)
 
         if phase == "PRE_ALERT":
             entry_time = (
-                signal.get("planned_entry_time")
-                or signal.get("entry_time")
-                or "بعد 60 ثانية تقريباً"
+                signal.get("entry_time")
+                or "غير محدد"
             )
 
-            confirm_time = signal.get("confirm_time", "قبل الدخول بـ15 ثانية")
+            confirm_time = signal.get(
+                "confirm_time",
+                "قبل الدخول بـ15 ثانية"
+            )
 
             message = (
                 "🔔 تنبيه فرصة OTC قادمة\n\n"
@@ -449,37 +445,39 @@ async def post_init(app):
                 f"موعد الدخول المقترح: {entry_time}\n\n"
                 f"{strategies_text}\n\n"
                 "⏳ سيعيد البوت فحص الإشارة قبل الدخول.\n"
-                "قد يتم إلغاؤها إذا تغيرت الشروط.\n"
-                "لا تدخل اعتماداً على هذا التنبيه وحده."
+                "إذا تم التأكيد، سيكون الدخول عند بداية الدقيقة المحددة.\n"
+                "لا تدخل إذا فاتك التوقيت أو لم تستطع التنفيذ."
             )
 
         elif phase == "ENTRY":
-            entry_time = (
-                signal.get("entry_time")
-                or signal.get("planned_entry_time")
-                or "غير محدد"
+            entry_time = signal.get("entry_time", "غير محدد")
+            exit_time = signal.get("exit_time", "بعد 60 ثانية")
+            entry_price = signal.get(
+                "price",
+                signal.get("entry_price", "غير محدد")
             )
 
-            entry_price = signal.get(
-                "entry_price",
-                signal.get("price", "غير محدد")
+            duration = int(
+                signal.get("duration_seconds", 60)
             )
 
             message = (
                 "🚨 تأكيد دخول تجريبي\n\n"
                 f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
-                f"الاتجاه: {signal.get('direction', 'غير محدد')}\n"
-                f"وقت الدخول الافتراضي: {entry_time}\n"
-                f"السعر المرجعي: {entry_price}\n\n"
+                f"الاتجاه: {signal.get('direction', 'غير محدد')}\n\n"
+                f"🕒 وقت الدخول المحدد: {entry_time}\n"
+                f"⏳ مدة الصفقة: {duration} ثانية (دقيقة واحدة)\n"
+                f"🏁 وقت انتهاء الدقيقة: {exit_time}\n"
+                f"💹 السعر المرجعي: {entry_price}\n\n"
                 f"{strategies_text}\n\n"
-                "مدة الصفقة التجريبية: دقيقة واحدة\n\n"
+                "📊 اختبار المقارنة الداخلي يشمل 60 و120 ثانية،\n"
+                "لكن مدة الصفقة الأساسية المعروضة هي دقيقة واحدة.\n\n"
                 "⚠️ هذه صفقة افتراضية وليست أمراً للتداول الحقيقي."
             )
 
         elif phase == "CANCELLED":
             entry_time = (
-                signal.get("planned_entry_time")
-                or signal.get("entry_time")
+                signal.get("entry_time")
                 or "غير محدد"
             )
 
