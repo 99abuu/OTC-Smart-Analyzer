@@ -63,7 +63,10 @@ def format_signal_details(signal):
 def format_duration(signal):
     duration = signal.get(
         "selected_duration_seconds",
-        signal.get("duration_seconds", 60)
+        signal.get(
+            "duration_seconds",
+            signal.get("selected_duration", 60)
+        )
     )
 
     try:
@@ -74,6 +77,7 @@ def format_duration(signal):
     if duration == 120:
         label = "دقيقتان (120 ثانية)"
     else:
+        duration = 60
         label = "دقيقة واحدة (60 ثانية)"
 
     reason = signal.get(
@@ -476,15 +480,19 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        duration_label, duration_reason = format_duration(signal)
+
         message = (
             "📡 تحليل يدوي تجريبي\n\n"
             f"الأداة: {selected}\n"
             f"الفريم: 1 دقيقة\n"
             f"الاتجاه: {signal['direction']}\n"
-            f"السعر المرجعي: {signal['price']}\n\n"
+            f"السعر المرجعي: {signal.get('price', 'غير متوفر')}\n\n"
+            f"⏱️ المدة المختارة تجريبياً: {duration_label}\n"
+            f"🧠 سبب اختيار المدة: {duration_reason}\n\n"
             f"{format_signal_details(signal)}\n\n"
-            "⚠️ هذا التحليل ليس إشارة دخول مباشرة، "
-            "ولا يتضمن اختيار مدة الصفقة الآلي."
+            "⚠️ هذا تحليل يدوي فقط، وليس تأكيد دخول. "
+            "الإشارات الآلية تخضع لإعادة التحقق قبل الدخول."
         )
 
         await update.message.reply_text(message)
@@ -596,8 +604,8 @@ async def post_init(app):
             entry_time = signal.get("entry_time", "غير محدد")
             exit_time = signal.get("exit_time", "غير محدد")
             entry_price = signal.get(
-                "price",
-                signal.get("entry_price", "غير محدد")
+                "entry_price",
+                signal.get("price", "غير محدد")
             )
 
             message = (
@@ -661,7 +669,12 @@ async def post_init(app):
             else "غير متوفرة"
         )
 
-        duration = result.get("duration_seconds", 60)
+        duration_label, duration_reason = format_duration(result)
+
+        duration = result.get(
+            "duration_seconds",
+            result.get("selected_duration_seconds", 60)
+        )
 
         try:
             duration = int(duration)
@@ -674,18 +687,13 @@ async def post_init(app):
             else "دقيقة واحدة (60 ثانية)"
         )
 
-        duration_reason = result.get(
-            "duration_reason",
-            "اختيار تجريبي حسب خصائص الإشارة"
-        )
-
         message = (
             "📊 نتيجة الصفقة التجريبية\n\n"
             f"{labels.get(result['result'], result['result'])}\n\n"
             f"الأداة: {result['symbol']}\n"
             f"الاتجاه: {result['direction']}\n"
-            f"المدة المختارة: {duration_label}\n"
-            f"سبب الاختيار: {duration_reason}\n"
+            f"مدة قياس النتيجة: {duration_label}\n"
+            f"سبب اختيار المدة الأساسية: {duration_reason}\n"
             f"سعر البداية: {result['entry_price']}\n"
             f"سعر النهاية: {result['exit_price']}\n"
             f"وقت البداية: {result['entry_time']}\n"
