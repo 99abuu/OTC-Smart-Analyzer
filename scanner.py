@@ -119,7 +119,22 @@ def market_score(candles, payout):
     else:
         consistency = 0
 
-    trend_score = min(100, consistency)
+    bullish = sum(
+        1 for c in recent if c["close"] > c["open"]
+    )
+
+    bearish = sum(
+        1 for c in recent if c["close"] < c["open"]
+    )
+
+    directional_candles = bullish + bearish
+
+    if directional_candles:
+        trend_score = (
+            max(bullish, bearish) / directional_candles
+        ) * 100
+    else:
+        trend_score = 0
 
     average_atr = mean([
         c["high"] - c["low"] for c in recent
@@ -619,7 +634,6 @@ async def scanner_loop(send_signal, send_result):
 
                 minute_bucket = int(timestamp // 60) * 60
 
-                # تسوية الصفقات التجريبية.
                 trade = pending_trades.get(symbol)
 
                 if trade and timestamp >= trade["settles_at"]:
@@ -656,7 +670,6 @@ async def scanner_loop(send_signal, send_result):
                         )
                     }
 
-                    # حفظ النتيجة قبل إرسال رسالة Telegram.
                     record_result(
                         trade.get("history_id"),
                         result,
@@ -686,7 +699,6 @@ async def scanner_loop(send_signal, send_result):
 
                     pending_trades.pop(symbol, None)
 
-                # بناء شموع الدقيقة.
                 candle = current_1m.get(symbol)
 
                 if candle is None:
@@ -727,7 +739,6 @@ async def scanner_loop(send_signal, send_result):
                 else:
                     continue
 
-                # إعادة التحقق من الإشارة قبل الدخول.
                 alert = pending_alerts.get(symbol)
 
                 if alert:
@@ -936,7 +947,6 @@ async def scanner_loop(send_signal, send_result):
                     )
                     continue
 
-                # تسجيل الإشارة بعد نجاح إرسال التنبيه.
                 history_id = record_signal(signal)
                 alert["history_id"] = history_id
 
