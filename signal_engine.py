@@ -6,6 +6,8 @@ from math import isfinite
 logger = logging.getLogger(__name__)
 
 MIN_CANDLES = 60
+EMA_LONG_PERIOD = 200
+ADX_PERIOD = 14
 SIGNAL_COOLDOWN_SECONDS = 3000
 
 _sent = {}
@@ -28,6 +30,9 @@ def valid_candles(candles):
             c = float(candle["close"])
 
             if not all(isfinite(x) for x in (o, h, l, c)):
+                continue
+
+            if min(o, h, l, c) <= 0:
                 continue
 
             if h < max(o, c, l) or l > min(o, c, h):
@@ -91,29 +96,133 @@ def rsi(values, period=14):
         return 100 if avg_gain > 0 else 50
 
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
+
+
+def true_ranges(candles):
+    ranges = []
+
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous_close = candles[i - 1]["close"]
+
+        ranges.append(max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous_close),
+            abs(current["low"] - previous_close)
+        ))
+
+    return ranges
 
 
 def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
 
-    ranges = []
+    ranges = true_ranges(candles)
 
-    for i in range(len(candles) - period, len(candles)):
+    return sum(ranges[-period:]) / period
+
+
+def adx(candles, period=ADX_PERIOD):
+    """
+    Wilder ADX calculation.
+    Returns ADX, +DI and -DI.
+    """
+
+    if len(candles) < (period * 2) + 1:
+        return None, None, None
+
+    trs = []
+    plus_dm = []
+    minus_dm = []
+
+    for i in range(1, len(candles)):
         current = candles[i]
-        previous_close = candles[i - 1]["close"]
+        previous = candles[i - 1]
 
-        true_range = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous_close),
-            abs(current["low"] - previous_close)
+        up_move = current["high"] - previous["high"]
+        down_move = previous["low"] - current["low"]
+
+        plus = (
+            up_move
+            if up_move > down_move and up_move > 0
+            else 0.0
         )
 
-        ranges.append(true_range)
+        minus = (
+            down_move
+            if down_move > up_move and down_move > 0
+            else 0.0
+        )
 
-    return sum(ranges) / len(ranges)
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
+        )
+
+        trs.append(tr)
+        plus_dm.append(plus)
+        minus_dm.append(minus)
+
+    smooth_tr = sum(trs[:period])
+    smooth_plus = sum(plus_dm[:period])
+    smooth_minus = sum(minus_dm[:period])
+
+    dx_values = []
+
+    def calculate_di():
+        if smooth_tr <= 0:
+            return 0.0, 0.0
+
+        plus_di = 100 * smooth_plus / smooth_tr
+        minus_di = 100 * smooth_minus / smooth_tr
+
+        return plus_di, minus_di
+
+    for i in range(period, len(trs)):
+        smooth_tr = (
+            smooth_tr - smooth_tr / period + trs[i]
+        )
+
+        smooth_plus = (
+            smooth_plus - smooth_plus / period + plus_dm[i]
+        )
+
+        smooth_minus = (
+            smooth_minus - smooth_minus / period + minus_dm[i]
+        )
+
+        plus_di, minus_di = calculate_di()
+
+        denominator = plus_di + minus_di
+
+        dx = (
+            100 * abs(plus_di - minus_di) / denominator
+            if denominator > 0
+            else 0.0
+        )
+
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None, None, None
+
+    current_adx = sum(dx_values[:period]) / period
+
+    for value in dx_values[period:]:
+        current_adx = (
+            current_adx * (period - 1) + value
+        ) / period
+
+    plus_di, minus_di = calculate_di()
+
+    return (
+        current_adx,
+        plus_di,
+        minus_di
+    )
 
 
 def candle_metrics(candle):
@@ -146,7 +255,7 @@ def get_trend(candles):
 
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
+    ema200 = ema(closes, EMA_LONG_PERIOD)
 
     if ema20 is None or ema50 is None:
         return "UNKNOWN", ema20, ema50, ema200
@@ -192,7 +301,6 @@ def find_support_resistance(candles, lookback=40):
     pivot_highs = []
 
     for i in range(1, len(history) - 1):
-
         previous = history[i - 1]
         current = history[i]
         following = history[i + 1]
@@ -341,7 +449,6 @@ def strategy_trend_pullback(candles, trend, average_atr=None):
         return None
 
     if trend == "UP":
-
         pullback = (
             previous["low"] <= ema20 + average_atr * 0.25
             and previous["low"] >= ema50 - average_atr * 0.80
@@ -361,7 +468,6 @@ def strategy_trend_pullback(candles, trend, average_atr=None):
             )
 
     if trend == "DOWN":
-
         pullback = (
             previous["high"] >= ema20 - average_atr * 0.25
             and previous["high"] <= ema50 + average_atr * 0.80
@@ -441,61 +547,106 @@ def calculate_signal_score(
     ema200,
     price,
     current_rsi,
-    metrics
+    metrics,
+    current_adx,
+    plus_di,
+    minus_di,
+    average_atr
 ):
-    score = 45
+    """
+    Quality score, not a win probability.
+    """
 
-    # عدد الاستراتيجيات المتوافقة
-    score += min(16, (len(selected) - 1) * 8)
+    score = 45.0
 
-    # قوة جسم شمعة الإشارة
-    score += min(12, metrics["body_ratio"] * 12)
+    # توافق أكثر من استراتيجية مستقلة
+    score += min(12, max(0, len(selected) - 1) * 6)
 
-    # موقع الإغلاق داخل الشمعة
+    # جودة شمعة الإشارة
+    score += metrics["body_ratio"] * 10
+
     if direction == "CALL":
-        score += metrics["close_position"] * 10
-
+        score += metrics["close_position"] * 8
     else:
-        score += (1 - metrics["close_position"]) * 10
+        score += (1 - metrics["close_position"]) * 8
 
-    # توافق الاتجاه العام
+    # توافق الاتجاه
     if (
         (direction == "CALL" and trend == "UP")
         or (direction == "PUT" and trend == "DOWN")
     ):
-        score += 8
+        score += 7
 
-    # توافق السعر مع EMA200
+    elif trend in ("UP", "DOWN"):
+        score -= 3
+
+    # EMA200
     if ema200 is not None:
-
         if (
             direction == "CALL"
             and price > ema200
-        ):
-            score += 5
-
-        elif (
+        ) or (
             direction == "PUT"
             and price < ema200
         ):
             score += 5
 
-    # RSI غير متطرف
+        else:
+            score -= 3
+
+    # RSI
     if current_rsi is not None:
+        if direction == "CALL":
+            if 45 <= current_rsi <= 68:
+                score += 4
+            elif current_rsi > 75:
+                score -= 4
+            elif current_rsi < 30:
+                score -= 2
 
-        if direction == "CALL" and 45 <= current_rsi <= 68:
-            score += 4
+        else:
+            if 32 <= current_rsi <= 55:
+                score += 4
+            elif current_rsi < 25:
+                score -= 4
+            elif current_rsi > 70:
+                score -= 2
 
-        elif direction == "PUT" and 32 <= current_rsi <= 55:
-            score += 4
+    # ADX يقيس قوة الاتجاه وليس اتجاهه
+    if current_adx is not None:
+        if current_adx >= 25:
+            score += 5
+        elif current_adx >= 20:
+            score += 3
+        elif current_adx < 12:
+            score -= 3
 
-    return round(min(95, score), 1)
+    # تأكيد اتجاه DI
+    if plus_di is not None and minus_di is not None:
+        if direction == "CALL" and plus_di > minus_di:
+            score += 3
+        elif direction == "PUT" and minus_di > plus_di:
+            score += 3
+        else:
+            score -= 2
+
+    # تجنب المبالغة في الحركة مقارنة بمتوسط ATR
+    if average_atr and average_atr > 0:
+        range_ratio = metrics["range"] / average_atr
+
+        if 0.65 <= range_ratio <= 1.8:
+            score += 3
+        elif range_ratio > 2.3:
+            score -= 5
+
+    return round(max(0, min(95, score)), 1)
 
 
 def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
-    # جميع الاستراتيجيات تعمل على فريم الدقيقة فقط.
-    # candles_5m محفوظ للتوافق مع النسخ السابقة.
+    # التحليل بالكامل على فريم الدقيقة.
+    # لا نستخدم بيانات 5m.
+
     candles = valid_candles(candles_1m)
 
     if len(candles) < MIN_CANDLES:
@@ -526,6 +677,8 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     trend, ema20, ema50, ema200 = get_trend(candles)
 
     current_rsi = rsi(closes)
+
+    current_adx, plus_di, minus_di = adx(candles)
 
     support, resistance = find_support_resistance(candles)
 
@@ -560,7 +713,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     puts = []
 
     for result in strategies:
-
         if result is None:
             continue
 
@@ -574,7 +726,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
     # منع الإشارات المتضاربة
     if calls and puts:
-
         logger.info(
             "Signal conflict | symbol=%s | CALL=%s | PUT=%s",
             symbol,
@@ -608,7 +759,11 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         ema200=ema200,
         price=price,
         current_rsi=current_rsi,
-        metrics=current_metrics
+        metrics=current_metrics,
+        current_adx=current_adx,
+        plus_di=plus_di,
+        minus_di=minus_di,
+        average_atr=average_atr
     )
 
     return {
@@ -618,7 +773,9 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         "pattern": ", ".join(matching_strategies),
         "score": score,
         "rsi": current_rsi,
-        "adx": 0,
+        "adx": current_adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
         "atr": average_atr,
         "body_ratio": current_metrics["body_ratio"],
         "expiry_minutes": 1,
@@ -632,6 +789,8 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         "resistance": resistance,
         "trend": trend,
         "trend_5m": "NOT_USED",
+        "ema20": ema20,
+        "ema50": ema50,
         "ema200": ema200,
         "analysis_timeframe": "1m"
     }
@@ -658,7 +817,6 @@ def is_new_signal(signal):
 
     _sent[key] = now
 
-    # تنظيف السجلات القديمة
     expired = [
         item for item, timestamp in _sent.items()
         if now - timestamp >= SIGNAL_COOLDOWN_SECONDS
