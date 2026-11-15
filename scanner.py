@@ -17,7 +17,6 @@ from trade_history import (
     record_horizon_result
 )
 
-
 logger = logging.getLogger(__name__)
 
 MAX_SYMBOLS = 5
@@ -300,7 +299,6 @@ def rank_otc_markets(current_symbols=None):
                 continue
 
             payout = parse_number(item.get("payout"))
-
             score = market_score(candles, payout)
 
             if score <= 0:
@@ -325,9 +323,7 @@ def rank_otc_markets(current_symbols=None):
         reverse=True
     )
 
-    selected = ranked[:MAX_SYMBOLS]
-
-    return selected, histories
+    return ranked[:MAX_SYMBOLS], histories
 
 
 def stream_worker(symbols, tick_queue, stop_event):
@@ -421,7 +417,6 @@ async def scanner_loop(send_signal, send_result):
         "Dual-duration comparison enabled: %s seconds",
         COMPARISON_DURATIONS
     )
-
     logger.info(
         "Market refresh interval: %s seconds",
         MARKET_REFRESH_SECONDS
@@ -532,7 +527,6 @@ async def scanner_loop(send_signal, send_result):
         )
 
         stop_event.set()
-
         await asyncio.to_thread(worker.join, 8)
 
         if worker.is_alive():
@@ -558,7 +552,6 @@ async def scanner_loop(send_signal, send_result):
             args=(symbols, tick_queue, stop_event),
             daemon=True
         )
-
         worker.start()
 
         logger.info(
@@ -660,11 +653,6 @@ async def scanner_loop(send_signal, send_result):
 
                 minute_bucket = int(timestamp // 60) * 60
 
-                # -------------------------------------------------
-                # Dual-duration paper comparison: 60s and 120s
-                # Both measurements use the exact same entry price.
-                # -------------------------------------------------
-
                 trade = pending_trades.get(symbol)
 
                 if trade:
@@ -744,7 +732,6 @@ async def scanner_loop(send_signal, send_result):
                                 price
                             )
 
-                        # Keep the existing one-minute result behavior.
                         if horizon == TRADE_DURATION:
                             result_data = {
                                 "symbol": symbol,
@@ -873,6 +860,13 @@ async def scanner_loop(send_signal, send_result):
                             message["entry_time"] = format_time(
                                 alert["entry_at"]
                             )
+                            message["exit_time"] = format_time(
+                                alert["entry_at"] + TRADE_DURATION
+                            )
+                            message["duration_seconds"] = TRADE_DURATION
+                            message["comparison_durations"] = list(
+                                COMPARISON_DURATIONS
+                            )
                             message["confirmation"] = reason
 
                             try:
@@ -889,7 +883,6 @@ async def scanner_loop(send_signal, send_result):
                                     alert.get("history_id"),
                                     "ENTRY_NOT_DELIVERED"
                                 )
-
                                 pending_alerts.pop(symbol, None)
 
                                 logger.warning(
@@ -906,7 +899,8 @@ async def scanner_loop(send_signal, send_result):
                                 "CONFIRMED",
                                 {
                                     "confirmation": reason,
-                                    "confirmation_price": price
+                                    "confirmation_price": price,
+                                    "planned_entry_time": alert["entry_at"]
                                 }
                             )
 
@@ -988,8 +982,6 @@ async def scanner_loop(send_signal, send_result):
                         pending_alerts.pop(symbol, None)
                         continue
 
-                # Keep the same symbol unavailable until both
-                # comparison measurements have been processed.
                 if symbol in pending_trades:
                     continue
 
@@ -1021,7 +1013,13 @@ async def scanner_loop(send_signal, send_result):
                 signal["analysis_timeframe"] = "1m"
                 signal["status"] = "PRE_ALERT"
 
-                entry_at = timestamp + PRE_ENTRY_SECONDS
+                # Schedule entry at a full UTC minute, while ensuring
+                # at least PRE_ENTRY_SECONDS notice from signal time.
+                earliest_entry = timestamp + PRE_ENTRY_SECONDS
+                entry_at = (
+                    (int(earliest_entry) + 59) // 60
+                ) * 60
+
                 confirm_at = entry_at - CONFIRM_BEFORE_ENTRY
 
                 alert = {
@@ -1033,15 +1031,22 @@ async def scanner_loop(send_signal, send_result):
                 }
 
                 logger.info(
-                    "SIGNAL FOUND: %s | %s | Strategies=%s",
+                    "SIGNAL FOUND: %s | %s | Strategies=%s | "
+                    "Planned entry=%s | Confirmation=%s",
                     symbol,
                     signal.get("direction"),
-                    signal.get("matching_strategies", [])
+                    signal.get("matching_strategies", []),
+                    format_time(entry_at),
+                    format_time(confirm_at)
                 )
 
                 message = dict(signal)
                 message["entry_time"] = format_time(entry_at)
                 message["confirm_time"] = format_time(confirm_at)
+                message["duration_seconds"] = TRADE_DURATION
+                message["exit_time"] = format_time(
+                    entry_at + TRADE_DURATION
+                )
 
                 try:
                     delivered = await send_signal(message)
@@ -1069,7 +1074,11 @@ async def scanner_loop(send_signal, send_result):
                         "PRE_ALERT_DELIVERED",
                         {
                             "entry_at": entry_at,
-                            "confirm_at": confirm_at
+                            "confirm_at": confirm_at,
+                            "duration_seconds": TRADE_DURATION,
+                            "comparison_durations": list(
+                                COMPARISON_DURATIONS
+                            )
                         }
                     )
 
