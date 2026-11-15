@@ -23,7 +23,7 @@ MAX_SYMBOLS = 5
 MAX_CANDIDATES = 18
 MARKET_REFRESH_SECONDS = 300
 
-TRADE_DURATION = 60
+DEFAULT_TRADE_DURATION = 60
 COMPARISON_DURATIONS = (60, 120)
 MAX_HORIZON_DELAY = 10
 
@@ -70,6 +70,77 @@ def calculate_outcome(direction, entry_price, exit_price):
         return "DRAW"
 
     return "DRAW"
+
+
+def select_trade_duration(signal):
+    """
+    Experimental rule-based duration selection.
+    The decision is made before entry and never uses future results.
+    """
+
+    direction = str(signal.get("direction", "")).upper()
+    trend = str(signal.get("trend", "")).upper()
+
+    adx_value = parse_number(signal.get("adx"), 0)
+
+    strategies = {
+        str(name).strip().lower()
+        for name in signal.get("matching_strategies", [])
+    }
+
+    trend_aligned = (
+        (direction == "CALL" and trend == "UP")
+        or (direction == "PUT" and trend == "DOWN")
+    )
+
+    trend_strategies = {
+        "trend pullback",
+        "breakout retest"
+    }
+
+    has_trend_strategy = bool(
+        strategies.intersection(trend_strategies)
+    )
+
+    # Two minutes are selected only when the trend is aligned,
+    # ADX indicates a reasonably strong trend, and a trend-based
+    # strategy is part of the signal.
+    if (
+        trend_aligned
+        and adx_value >= 22
+        and has_trend_strategy
+    ):
+        return (
+            120,
+            "اتجاه واضح وقوة ADX مناسبة مع تحقق استراتيجية اتجاهية"
+        )
+
+    # Rejection strategies and weaker/unclear trends use 60 seconds.
+    if strategies.intersection({
+        "support rejection",
+        "resistance rejection"
+    }):
+        return (
+            60,
+            "إشارة ارتداد من دعم أو مقاومة؛ المدة التجريبية الأقصر أنسب للاختبار"
+        )
+
+    if not trend_aligned:
+        return (
+            60,
+            "الاتجاه غير متوافق بوضوح مع الإشارة؛ تم اختيار المدة الأقصر"
+        )
+
+    if adx_value < 22:
+        return (
+            60,
+            "قوة الاتجاه غير كافية لاختيار دقيقتين؛ تم اختيار 60 ثانية"
+        )
+
+    return (
+        DEFAULT_TRADE_DURATION,
+        "لا توجد خصائص كافية لتفضيل دقيقتين؛ الاختيار الافتراضي 60 ثانية"
+    )
 
 
 def valid_market_candles(candles):
@@ -420,6 +491,7 @@ async def scanner_loop(send_signal, send_result):
         "Dual-duration comparison enabled: %s seconds",
         COMPARISON_DURATIONS
     )
+    logger.info("Dynamic duration selection enabled")
     logger.info(
         "Market refresh interval: %s seconds",
         MARKET_REFRESH_SECONDS
@@ -654,7 +726,6 @@ async def scanner_loop(send_signal, send_result):
                     continue
 
                 price = parse_number(tick.get("price"))
-
                 raw_timestamp = parse_number(tick.get("time"))
 
                 if price <= 0 or raw_timestamp <= 0:
@@ -724,7 +795,10 @@ async def scanner_loop(send_signal, send_result):
                             "target_time": target_time,
                             "observed_time": timestamp,
                             "delay_seconds": delay,
-                            "measurement_price": price
+                            "measurement_price": price,
+                            "selected_duration_seconds": trade[
+                                "selected_duration_seconds"
+                            ]
                         }
 
                         saved = record_horizon_result(
@@ -749,7 +823,8 @@ async def scanner_loop(send_signal, send_result):
                                 price
                             )
 
-                        if horizon == TRADE_DURATION:
+                        # The selected horizon becomes the primary result.
+                        if horizon == trade["selected_duration_seconds"]:
                             result_data = {
                                 "symbol": symbol,
                                 "direction": trade["direction"],
@@ -760,6 +835,10 @@ async def scanner_loop(send_signal, send_result):
                                 ),
                                 "exit_time": format_time(timestamp),
                                 "result": outcome,
+                                "duration_seconds": horizon,
+                                "duration_reason": trade.get(
+                                    "duration_reason", ""
+                                ),
                                 "strategies": trade.get("strategies", []),
                                 "strategy_reasons": trade.get(
                                     "strategy_reasons", []
@@ -778,13 +857,14 @@ async def scanner_loop(send_signal, send_result):
                                 await send_result(result_data)
                             except Exception:
                                 logger.exception(
-                                    "One-minute result delivery failed: %s",
+                                    "Selected-duration result delivery failed: %s",
                                     symbol
                                 )
 
                             logger.info(
-                                "PAPER RESULT 60s: %s | %s | %s | "
+                                "PAPER RESULT %ss: %s | %s | %s | "
                                 "Strategies=%s",
+                                horizon,
                                 symbol,
                                 trade["direction"],
                                 outcome,
@@ -799,7 +879,10 @@ async def scanner_loop(send_signal, send_result):
                             trade.get("history_id"),
                             "DURATION_COMPARISON_COMPLETED",
                             {
-                                "durations": list(COMPARISON_DURATIONS)
+                                "durations": list(COMPARISON_DURATIONS),
+                                "selected_duration_seconds": trade[
+                                    "selected_duration_seconds"
+                                ]
                             }
                         )
 
@@ -877,10 +960,19 @@ async def scanner_loop(send_signal, send_result):
                             message["entry_time"] = format_time(
                                 alert["entry_at"]
                             )
+                            message["duration_seconds"] = alert[
+                                "selected_duration_seconds"
+                            ]
+                            message["selected_duration_seconds"] = alert[
+                                "selected_duration_seconds"
+                            ]
+                            message["duration_reason"] = alert[
+                                "duration_reason"
+                            ]
                             message["exit_time"] = format_time(
-                                alert["entry_at"] + TRADE_DURATION
+                                alert["entry_at"]
+                                + alert["selected_duration_seconds"]
                             )
-                            message["duration_seconds"] = TRADE_DURATION
                             message["comparison_durations"] = list(
                                 COMPARISON_DURATIONS
                             )
@@ -917,14 +1009,22 @@ async def scanner_loop(send_signal, send_result):
                                 {
                                     "confirmation": reason,
                                     "confirmation_price": price,
-                                    "planned_entry_time": alert["entry_at"]
+                                    "planned_entry_time": alert["entry_at"],
+                                    "selected_duration_seconds": alert[
+                                        "selected_duration_seconds"
+                                    ],
+                                    "duration_reason": alert[
+                                        "duration_reason"
+                                    ]
                                 }
                             )
 
                             logger.info(
-                                "SIGNAL CONFIRMED AND DELIVERED: %s | %s",
+                                "SIGNAL CONFIRMED AND DELIVERED: %s | %s | "
+                                "duration=%ss",
                                 symbol,
-                                alert["signal"]["direction"]
+                                alert["signal"]["direction"],
+                                alert["selected_duration_seconds"]
                             )
 
                         else:
@@ -959,6 +1059,9 @@ async def scanner_loop(send_signal, send_result):
                             continue
 
                         signal = alert["signal"]
+                        selected_duration = alert[
+                            "selected_duration_seconds"
+                        ]
 
                         pending_trades[symbol] = {
                             "symbol": symbol,
@@ -972,6 +1075,8 @@ async def scanner_loop(send_signal, send_result):
                                 signal.get("strategy_reasons", [])
                             ),
                             "history_id": alert.get("history_id"),
+                            "selected_duration_seconds": selected_duration,
+                            "duration_reason": alert["duration_reason"],
                             "processed_horizons": set()
                         }
 
@@ -983,17 +1088,19 @@ async def scanner_loop(send_signal, send_result):
                                 "entry_time": timestamp,
                                 "comparison_durations": list(
                                     COMPARISON_DURATIONS
-                                )
+                                ),
+                                "selected_duration_seconds": selected_duration,
+                                "duration_reason": alert["duration_reason"]
                             }
                         )
 
                         logger.info(
                             "PAPER TRADE STARTED: %s | %s | "
-                            "Entry=%s | Comparison=60s/120s | Strategies=%s",
+                            "Entry=%s | Selected=%ss | Comparison=60s/120s",
                             symbol,
                             signal["direction"],
                             price,
-                            signal.get("matching_strategies", [])
+                            selected_duration
                         )
 
                         pending_alerts.pop(symbol, None)
@@ -1026,9 +1133,17 @@ async def scanner_loop(send_signal, send_result):
 
                 signal["symbol"] = symbol
                 signal["price"] = price
-                signal["expiry_minutes"] = 1
                 signal["analysis_timeframe"] = "1m"
                 signal["status"] = "PRE_ALERT"
+
+                selected_duration, duration_reason = (
+                    select_trade_duration(signal)
+                )
+
+                signal["selected_duration_seconds"] = selected_duration
+                signal["duration_seconds"] = selected_duration
+                signal["duration_reason"] = duration_reason
+                signal["expiry_minutes"] = selected_duration // 60
 
                 # Keep the agreed entry schedule unchanged.
                 earliest_entry = timestamp + PRE_ENTRY_SECONDS
@@ -1043,15 +1158,20 @@ async def scanner_loop(send_signal, send_result):
                     "entry_at": entry_at,
                     "confirm_at": confirm_at,
                     "status": "WAIT_CONFIRM",
-                    "history_id": None
+                    "history_id": None,
+                    "selected_duration_seconds": selected_duration,
+                    "duration_reason": duration_reason
                 }
 
                 logger.info(
                     "SIGNAL FOUND: %s | %s | Strategies=%s | "
+                    "Selected duration=%ss | Reason=%s | "
                     "Planned entry=%s | Confirmation=%s",
                     symbol,
                     signal.get("direction"),
                     signal.get("matching_strategies", []),
+                    selected_duration,
+                    duration_reason,
                     format_time(entry_at),
                     format_time(confirm_at)
                 )
@@ -1059,9 +1179,11 @@ async def scanner_loop(send_signal, send_result):
                 message = dict(signal)
                 message["entry_time"] = format_time(entry_at)
                 message["confirm_time"] = format_time(confirm_at)
-                message["duration_seconds"] = TRADE_DURATION
+                message["duration_seconds"] = selected_duration
+                message["selected_duration_seconds"] = selected_duration
+                message["duration_reason"] = duration_reason
                 message["exit_time"] = format_time(
-                    entry_at + TRADE_DURATION
+                    entry_at + selected_duration
                 )
 
                 try:
@@ -1091,7 +1213,9 @@ async def scanner_loop(send_signal, send_result):
                         {
                             "entry_at": entry_at,
                             "confirm_at": confirm_at,
-                            "duration_seconds": TRADE_DURATION,
+                            "duration_seconds": selected_duration,
+                            "selected_duration_seconds": selected_duration,
+                            "duration_reason": duration_reason,
                             "comparison_durations": list(
                                 COMPARISON_DURATIONS
                             )
@@ -1102,9 +1226,11 @@ async def scanner_loop(send_signal, send_result):
                 last_signal_time[symbol] = timestamp
 
                 logger.info(
-                    "PRE-ALERT DELIVERED: %s %s | confirm=%s | entry=%s",
+                    "PRE-ALERT DELIVERED: %s %s | "
+                    "duration=%ss | confirm=%s | entry=%s",
                     symbol,
                     signal["direction"],
+                    selected_duration,
                     format_time(confirm_at),
                     format_time(entry_at)
                 )
