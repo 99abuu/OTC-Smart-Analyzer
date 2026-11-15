@@ -1,4 +1,4 @@
-📊 إحصائيات OTC Smart Analyzer
+
 import json
 import logging
 import threading
@@ -17,7 +17,6 @@ def utc_now():
 
 
 def write_event(event):
-    """Save one event as a JSONL record."""
     try:
         line = json.dumps(
             event,
@@ -39,7 +38,6 @@ def write_event(event):
 
 
 def record_signal(signal):
-    """Save the original signal and its analysis features."""
     signal_id = str(uuid.uuid4())
 
     event = {
@@ -58,7 +56,6 @@ def record_signal(signal):
 
 
 def record_update(signal_id, status, details=None):
-    """Save a signal lifecycle update."""
     if not signal_id:
         return False
 
@@ -80,10 +77,6 @@ def record_result(
     exit_price=None,
     details=None
 ):
-    """
-    Preserve the existing result format for compatibility
-    with the current scanner and statistics command.
-    """
     if not signal_id:
         return False
 
@@ -116,12 +109,6 @@ def record_horizon_result(
     exit_price=None,
     details=None
 ):
-    """
-    Save an independent paper result for a specific duration:
-    60 seconds or 120 seconds.
-
-    The same signal can have one result for each duration.
-    """
     if not signal_id:
         return False
 
