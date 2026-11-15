@@ -60,6 +60,30 @@ def format_signal_details(signal):
     )
 
 
+def format_duration(signal):
+    duration = signal.get(
+        "selected_duration_seconds",
+        signal.get("duration_seconds", 60)
+    )
+
+    try:
+        duration = int(duration)
+    except (TypeError, ValueError):
+        duration = 60
+
+    if duration == 120:
+        label = "دقيقتان (120 ثانية)"
+    else:
+        label = "دقيقة واحدة (60 ثانية)"
+
+    reason = signal.get(
+        "duration_reason",
+        "اختيار تجريبي حسب خصائص الإشارة"
+    )
+
+    return label, reason
+
+
 def signal_phase(signal):
     return signal.get("phase") or signal.get("status")
 
@@ -231,7 +255,7 @@ def build_stats_message(data):
         f"❌ الإشارات الملغاة: {len(cancelled_ids)}",
         "",
         "━━━━━━━━━━━━━━━━",
-        "⏱️ مقارنة مدة الصفقة",
+        "⏱️ مقارنة مدة الصفقة"
     ]
 
     horizon_stats, paired = build_horizon_stats(horizon_results)
@@ -349,8 +373,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 OTC Smart Analyzer\n\n"
         "✅ تم تسجيلك لاستقبال الإشارات تلقائياً\n"
         "🔍 مراقبة أفضل 5 أدوات OTC\n"
-        "⏱️ تنبيه مسبق قبل الدخول\n"
-        "📊 متابعة نتائج الصفقات التجريبية\n"
+        "⏱️ اختيار تجريبي لمدة الصفقة: 60 أو 120 ثانية\n"
+        "📊 مقارنة نتائج المدتين\n"
         "🧠 استراتيجيات مستقلة متعددة\n"
         "📈 التحليل على فريم الدقيقة فقط\n\n"
         "/status - حالة البوت\n"
@@ -375,10 +399,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "الأدوات المستهدفة: 5\n"
         "فريم التحليل: دقيقة واحدة فقط\n"
         "الدخول المقترح: بداية دقيقة UTC\n"
-        "مدة الصفقة التجريبية: 60 ثانية\n"
-        "مقارنة إضافية: 120 ثانية\n"
+        "اختيار مدة الصفقة: 60 أو 120 ثانية\n"
+        "مقارنة النتائج: المدتان معاً\n"
         f"المشتركون الحاليون: {len(subscribers)}\n\n"
-        "⚠️ النتائج تجريبية فقط."
+        "⚠️ اختيار المدة تجريبي والنتائج افتراضية فقط."
     )
 
 
@@ -459,7 +483,8 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"الاتجاه: {signal['direction']}\n"
             f"السعر المرجعي: {signal['price']}\n\n"
             f"{format_signal_details(signal)}\n\n"
-            "⚠️ هذا التحليل ليس إشارة دخول مباشرة."
+            "⚠️ هذا التحليل ليس إشارة دخول مباشرة، "
+            "ولا يتضمن اختيار مدة الصفقة الآلي."
         )
 
         await update.message.reply_text(message)
@@ -539,6 +564,8 @@ async def post_init(app):
         phase = signal_phase(signal)
         strategies_text = format_signal_details(signal)
 
+        duration_label, duration_reason = format_duration(signal)
+
         if phase == "PRE_ALERT":
             entry_time = (
                 signal.get("entry_time")
@@ -557,6 +584,8 @@ async def post_init(app):
                 f"وقت التنبيه: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
                 f"موعد التأكيد: {confirm_time}\n"
                 f"موعد الدخول المقترح: {entry_time}\n\n"
+                f"⏱️ المدة المختارة تجريبياً: {duration_label}\n"
+                f"🧠 سبب اختيار المدة: {duration_reason}\n\n"
                 f"{strategies_text}\n\n"
                 "⏳ سيعيد البوت فحص الإشارة قبل الدخول.\n"
                 "إذا تم التأكيد، سيكون الدخول عند بداية الدقيقة المحددة.\n"
@@ -565,14 +594,10 @@ async def post_init(app):
 
         elif phase == "ENTRY":
             entry_time = signal.get("entry_time", "غير محدد")
-            exit_time = signal.get("exit_time", "بعد 60 ثانية")
+            exit_time = signal.get("exit_time", "غير محدد")
             entry_price = signal.get(
                 "price",
                 signal.get("entry_price", "غير محدد")
-            )
-
-            duration = int(
-                signal.get("duration_seconds", 60)
             )
 
             message = (
@@ -580,12 +605,13 @@ async def post_init(app):
                 f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
                 f"الاتجاه: {signal.get('direction', 'غير محدد')}\n\n"
                 f"🕒 وقت الدخول المحدد: {entry_time}\n"
-                f"⏳ مدة الصفقة: {duration} ثانية (دقيقة واحدة)\n"
-                f"🏁 وقت انتهاء الدقيقة: {exit_time}\n"
+                f"⏱️ المدة المختارة: {duration_label}\n"
+                f"🧠 سبب الاختيار: {duration_reason}\n"
+                f"🏁 وقت انتهاء الصفقة: {exit_time}\n"
                 f"💹 السعر المرجعي: {entry_price}\n\n"
                 f"{strategies_text}\n\n"
-                "📊 اختبار المقارنة الداخلي يشمل 60 و120 ثانية،\n"
-                "لكن مدة الصفقة الأساسية المعروضة هي دقيقة واحدة.\n\n"
+                "📊 سيقارن البوت داخلياً نتيجة 60 و120 ثانية، "
+                "لكن النتيجة الأساسية ستكون للمدة المختارة.\n\n"
                 "⚠️ هذه صفقة افتراضية وليست أمراً للتداول الحقيقي."
             )
 
@@ -635,11 +661,31 @@ async def post_init(app):
             else "غير متوفرة"
         )
 
+        duration = result.get("duration_seconds", 60)
+
+        try:
+            duration = int(duration)
+        except (TypeError, ValueError):
+            duration = 60
+
+        duration_label = (
+            "دقيقتان (120 ثانية)"
+            if duration == 120
+            else "دقيقة واحدة (60 ثانية)"
+        )
+
+        duration_reason = result.get(
+            "duration_reason",
+            "اختيار تجريبي حسب خصائص الإشارة"
+        )
+
         message = (
             "📊 نتيجة الصفقة التجريبية\n\n"
             f"{labels.get(result['result'], result['result'])}\n\n"
             f"الأداة: {result['symbol']}\n"
             f"الاتجاه: {result['direction']}\n"
+            f"المدة المختارة: {duration_label}\n"
+            f"سبب الاختيار: {duration_reason}\n"
             f"سعر البداية: {result['entry_price']}\n"
             f"سعر النهاية: {result['exit_price']}\n"
             f"وقت البداية: {result['entry_time']}\n"
