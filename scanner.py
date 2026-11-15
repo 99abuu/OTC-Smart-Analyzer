@@ -31,8 +31,8 @@ PRE_ENTRY_SECONDS = 60
 CONFIRM_BEFORE_ENTRY = 15
 MAX_ENTRY_DELAY = 10
 
-HISTORY_1M = 80
-MIN_CANDLES_1M = 60
+HISTORY_1M = 250
+MIN_CANDLES_1M = 200
 MAX_CANDLES = 400
 
 
@@ -420,6 +420,10 @@ async def scanner_loop(send_signal, send_result):
     logger.info(
         "Market refresh interval: %s seconds",
         MARKET_REFRESH_SECONDS
+    )
+    logger.info(
+        "1m candle history target: %s",
+        HISTORY_1M
     )
 
     selected, initial_histories = await asyncio.to_thread(
@@ -1013,8 +1017,7 @@ async def scanner_loop(send_signal, send_result):
                 signal["analysis_timeframe"] = "1m"
                 signal["status"] = "PRE_ALERT"
 
-                # Schedule entry at a full UTC minute, while ensuring
-                # at least PRE_ENTRY_SECONDS notice from signal time.
+                # Keep the agreed entry schedule unchanged.
                 earliest_entry = timestamp + PRE_ENTRY_SECONDS
                 entry_at = (
                     (int(earliest_entry) + 59) // 60
