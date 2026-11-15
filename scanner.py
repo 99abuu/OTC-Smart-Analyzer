@@ -5,6 +5,7 @@ import threading
 import queue
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from statistics import mean
 
 from market_data import fetch_otc_symbols, fetch_candles, stream_ticks
@@ -43,11 +44,26 @@ MAX_CANDLES = 400
 # OTC stream timestamps are 2 hours ahead of UTC server time.
 OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
+# Local timezone for Northern Cyprus.
+# Automatically handles summer/winter time.
+LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
+
 
 def format_time(timestamp):
-    return datetime.fromtimestamp(
-        timestamp, timezone.utc
-    ).strftime("%H:%M:%S UTC")
+    local_time = datetime.fromtimestamp(
+        timestamp,
+        LOCAL_TIMEZONE
+    ).strftime("%H:%M:%S")
+
+    utc_time = datetime.fromtimestamp(
+        timestamp,
+        timezone.utc
+    ).strftime("%H:%M:%S")
+
+    return (
+        f"{local_time} (توقيتك المحلي) "
+        f"| {utc_time} UTC"
+    )
 
 
 def parse_number(value, default=0):
@@ -437,6 +453,9 @@ async def scanner_loop(send_signal, send_result):
     logger.info(
         "OTC tick timestamp correction: -%s seconds",
         OTC_TICK_TIME_OFFSET_SECONDS
+    )
+    logger.info(
+        "Display timezone: Europe/Nicosia"
     )
 
     selected, initial_histories = await asyncio.to_thread(
