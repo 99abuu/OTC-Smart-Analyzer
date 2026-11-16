@@ -1,4 +1,3 @@
-
 import logging
 import time
 from math import isfinite
@@ -550,17 +549,39 @@ def calculate_signal_score(
 ):
     """
     Quality score, not a win probability.
+
+    The score evaluates candle structure, trend alignment,
+    momentum and directional confirmation.
+
+    It is diagnostic information. It does not guarantee
+    that a signal will win.
     """
 
     score = 45.0
 
-    score += min(12, max(0, len(selected) - 1) * 6)
+    strategy_count = len(selected)
+
+    if strategy_count >= 2:
+        score += min(12, (strategy_count - 1) * 6)
+
     score += metrics["body_ratio"] * 10
 
     if direction == "CALL":
         score += metrics["close_position"] * 8
+        wick_ratio = (
+            metrics["lower_wick"] / metrics["range"]
+            if metrics["range"] > 0 else 0
+        )
     else:
         score += (1 - metrics["close_position"]) * 8
+        wick_ratio = (
+            metrics["upper_wick"] / metrics["range"]
+            if metrics["range"] > 0 else 0
+        )
+
+    # A directional rejection wick can support the signal.
+    if wick_ratio >= 0.25:
+        score += 2
 
     if (
         (direction == "CALL" and trend == "UP")
@@ -621,6 +642,8 @@ def calculate_signal_score(
             score += 3
         elif range_ratio > 2.3:
             score -= 5
+        elif range_ratio < 0.45:
+            score -= 2
 
     return round(max(0, min(95, score)), 1)
 
@@ -629,6 +652,7 @@ def select_trade_duration(signal):
     """
     Experimental rule-based duration selection.
     Returns 60 or 120 seconds and an explanation.
+
     This is not an AI model or a win probability.
     """
 
@@ -774,6 +798,7 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         elif direction == "PUT":
             puts.append((reason, direction))
 
+    # لا نرسل اتجاهين متضادين للسوق نفسه.
     if calls and puts:
         logger.info(
             "Signal conflict | symbol=%s | CALL=%s | PUT=%s",
