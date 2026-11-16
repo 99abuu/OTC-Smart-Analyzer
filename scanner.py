@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import threading
@@ -266,7 +265,11 @@ def market_score(candles, payout):
     ranges = [
         (c["high"] - c["low"]) / c["close"] * 100
         for c in recent
+        if c["close"] > 0
     ]
+
+    if not ranges:
+        return 0
 
     average_range = mean(ranges)
 
@@ -290,6 +293,8 @@ def market_score(candles, payout):
         ) * 100
     else:
         consistency = 0
+
+    consistency = max(0, min(100, consistency))
 
     bullish = sum(
         1 for c in recent
@@ -390,7 +395,103 @@ def market_score(candles, payout):
         + payout_score * 0.10
     )
 
-    return round(final_score, 2)
+    return round(max(0, min(100, final_score)), 2)
+
+
+# --------------------------------------------------
+# BALANCED MARKET CANDIDATE SELECTION
+# --------------------------------------------------
+
+def select_market_candidates(open_symbols, current_symbols=None):
+    """
+    Select a payout-diverse candidate sample.
+
+    Payout is used to spread the sample across its range,
+    not to decide the final market ranking.
+
+    The final five markets are selected by market_score.
+    """
+
+    current_symbols = current_symbols or []
+
+    if not open_symbols:
+        return []
+
+    ordered = sorted(
+        open_symbols,
+        key=lambda item: parse_number(item.get("payout")),
+        reverse=True
+    )
+
+    by_symbol = {
+        item["symbol"]: item
+        for item in ordered
+    }
+
+    selected = []
+    seen = set()
+
+    # Retain currently active markets when possible.
+    for symbol in current_symbols:
+        item = by_symbol.get(symbol)
+
+        if item and symbol not in seen:
+            selected.append(item)
+            seen.add(symbol)
+
+    target_count = min(
+        MAX_CANDIDATES,
+        len(ordered)
+    )
+
+    if len(selected) >= target_count:
+        return selected[:target_count]
+
+    remaining_slots = target_count - len(selected)
+
+    # Evenly sample the payout-sorted list.
+    # This prevents the highest payout group from
+    # monopolizing the candidate list.
+    if remaining_slots == 1:
+        indexes = [len(ordered) // 2]
+    else:
+        indexes = [
+            round(
+                i * (len(ordered) - 1)
+                / max(1, remaining_slots - 1)
+            )
+            for i in range(remaining_slots)
+        ]
+
+    for index in indexes:
+        item = ordered[index]
+        symbol = item["symbol"]
+
+        if symbol in seen:
+            continue
+
+        selected.append(item)
+        seen.add(symbol)
+
+        if len(selected) >= target_count:
+            break
+
+    # Fill any gaps caused by duplicate indexes or
+    # already-retained active markets.
+    if len(selected) < target_count:
+        for item in ordered:
+            symbol = item["symbol"]
+
+            if symbol in seen:
+                continue
+
+            selected.append(item)
+            seen.add(symbol)
+
+            if len(selected) >= target_count:
+                break
+
+    return selected
 
 
 # --------------------------------------------------
@@ -413,42 +514,24 @@ def rank_otc_markets(current_symbols=None):
         and item.get("symbol")
     ]
 
-    open_symbols.sort(
-        key=lambda item: parse_number(
-            item.get("payout")
-        ),
-        reverse=True
+    if not open_symbols:
+        return [], {}
+
+    candidates = select_market_candidates(
+        open_symbols,
+        current_symbols
     )
-
-    candidates = []
-    seen = set()
-
-    by_symbol = {
-        item["symbol"]: item
-        for item in open_symbols
-    }
-
-    for symbol in current_symbols:
-        if symbol in by_symbol and symbol not in seen:
-            candidates.append(by_symbol[symbol])
-            seen.add(symbol)
-
-    for item in open_symbols:
-        symbol = item["symbol"]
-
-        if symbol in seen:
-            continue
-
-        candidates.append(item)
-        seen.add(symbol)
-
-        if len(candidates) >= MAX_CANDIDATES:
-            break
 
     ranked = []
     histories = {}
 
     current_bucket = int(time.time() // 60) * 60
+
+    logger.info(
+        "Market candidate evaluation: %s candidates from %s open OTC markets",
+        len(candidates),
+        len(open_symbols)
+    )
 
     for item in candidates:
         symbol = item["symbol"]
@@ -509,6 +592,12 @@ def rank_otc_markets(current_symbols=None):
     ranked.sort(
         key=lambda item: item["score"],
         reverse=True
+    )
+
+    logger.info(
+        "Market ranking completed: evaluated=%s | eligible=%s",
+        len(candidates),
+        len(ranked)
     )
 
     return ranked[:MAX_SYMBOLS], histories
@@ -686,7 +775,7 @@ def validate_pending_signal(
     original = alert["signal"]
     direction = original.get("direction")
 
-    # استخدام الشموع المكتملة فقط، كما في التحليل الأصلي.
+    # Re-check using completed candles only.
     fresh_signal = analyze_signal(
         candles_1m,
         symbol=original.get("symbol")
@@ -1162,12 +1251,13 @@ async def scanner_loop(send_signal, send_result):
 
                             logger.info(
                                 "HORIZON RESULT: %s | %ss | %s | "
-                                "entry=%s | exit=%s",
+                                "entry=%s | exit=%s | delay=%ss",
                                 symbol,
                                 horizon,
                                 outcome,
                                 trade["entry_price"],
-                                price
+                                price,
+                                delay
                             )
 
                         else:
@@ -1755,11 +1845,12 @@ async def scanner_loop(send_signal, send_result):
                 }
 
                 logger.info(
-                    "SIGNAL FOUND: %s | %s | Strategies=%s | "
+                    "SIGNAL FOUND: %s | %s | Score=%s | Strategies=%s | "
                     "Selected duration=%ss | Reason=%s | "
                     "Planned entry=%s | Confirmation=%s",
                     symbol,
                     signal.get("direction"),
+                    signal.get("score"),
                     signal.get("matching_strategies", []),
                     selected_duration,
                     duration_reason,
@@ -1829,9 +1920,10 @@ async def scanner_loop(send_signal, send_result):
 
                 logger.info(
                     "PRE-ALERT DELIVERED: %s %s | "
-                    "duration=%ss | confirm=%s | entry=%s",
+                    "score=%s | duration=%ss | confirm=%s | entry=%s",
                     symbol,
                     signal["direction"],
+                    signal.get("score"),
                     selected_duration,
                     format_time(confirm_at),
                     format_time(entry_at)
