@@ -1,3 +1,4 @@
+
 import logging
 import time
 from math import isfinite
@@ -445,7 +446,6 @@ def find_clustered_level(pivots, price, average_atr, direction):
     if not candidates:
         return None
 
-    # نختار أقرب منطقة مؤكدة للسعر.
     candidates.sort(key=lambda item: item["distance"])
 
     return candidates[0]
@@ -524,7 +524,6 @@ def strategy_support_rejection(
     tolerance = average_atr * 0.25
     breakout_buffer = average_atr * 0.08
 
-    # الحالة الأولى: كسر كاذب للدعم.
     false_breakout = (
         previous["low"] < support - breakout_buffer
         and previous["close"] < support
@@ -540,7 +539,6 @@ def strategy_support_rejection(
             "Support Rejection: كسر كاذب للدعم وعودة مؤكدة فوق المنطقة"
         )
 
-    # الحالة الثانية: لمس منطقة دعم مع رفض واضح.
     touched_level = (
         current["low"] <= support + tolerance
         and current["low"] >= support - average_atr * 0.35
@@ -587,7 +585,6 @@ def strategy_resistance_rejection(
     tolerance = average_atr * 0.25
     breakout_buffer = average_atr * 0.08
 
-    # الحالة الأولى: كسر كاذب للمقاومة.
     false_breakout = (
         previous["high"] > resistance + breakout_buffer
         and previous["close"] > resistance
@@ -603,7 +600,6 @@ def strategy_resistance_rejection(
             "Resistance Rejection: كسر كاذب للمقاومة وعودة مؤكدة أسفل المنطقة"
         )
 
-    # الحالة الثانية: لمس مقاومة مع رفض واضح.
     touched_level = (
         current["high"] >= resistance - tolerance
         and current["high"] <= resistance + average_atr * 0.35
@@ -636,16 +632,32 @@ def strategy_trend_pullback(
     minus_di=None
 ):
     """
-    اتجاه قوي + تصحيح منظم + استئناف مؤكد.
+    Trend Pullback المطورة:
+
+    1. اتجاه واضح وبنية سوق متوافقة.
+    2. حركة اتجاهية سابقة كافية.
+    3. تصحيح منظم باتجاه EMA20 أو EMA50.
+    4. عدم إبطال التصحيح لبنية الاتجاه.
+    5. شمعة استئناف مؤكدة.
+    6. منع الدخول بعد حركة ممتدة بشكل مبالغ فيه.
     """
 
     if trend not in ("UP", "DOWN"):
         return None
 
-    closes = [c["close"] for c in candles]
-
-    if len(candles) < 55:
+    if len(candles) < 65:
         return None
+
+    if average_atr is None or average_atr <= 0:
+        return None
+
+    if current_adx is None or current_adx < TREND_ADX_MIN:
+        return None
+
+    if plus_di is None or minus_di is None:
+        return None
+
+    closes = [c["close"] for c in candles]
 
     current = candles[-1]
     previous = candles[-2]
@@ -660,13 +672,8 @@ def strategy_trend_pullback(
         ema20 is None
         or ema50 is None
         or current_rsi is None
-        or average_atr is None
         or slope20 is None
-        or current_adx is None
     ):
-        return None
-
-    if current_adx < TREND_ADX_MIN:
         return None
 
     metrics = candle_metrics(current)
@@ -674,92 +681,203 @@ def strategy_trend_pullback(
     if not metrics:
         return None
 
-    if metrics["body_ratio"] < 0.40:
+    # لا نقبل شمعة ضعيفة أو شمعة اندفاعية مبالغاً فيها.
+    if metrics["body_ratio"] < 0.35:
         return None
 
-    if metrics["range"] < average_atr * 0.50:
+    if metrics["range"] < average_atr * 0.45:
         return None
 
-    if metrics["range"] > average_atr * 2.0:
+    if metrics["range"] > average_atr * 1.8:
         return None
+
+    # آخر أربع شمعات مكتملة قبل شمعة التأكيد.
+    pullback_candles = candles[-5:-1]
+
+    # -------------------------------------------------
+    # الاتجاه الصاعد
+    # -------------------------------------------------
 
     if trend == "UP":
-        if structure != "UP" or slope20 <= 0:
-            return None
 
-        if plus_di is None or minus_di is None:
+        if structure != "UP" or slope20 <= 0:
             return None
 
         if plus_di <= minus_di:
             return None
 
-        # يجب أن يكون هناك تصحيح سابق باتجاه EMA20 أو EMA50.
-        pullback_candles = candles[-5:-1]
-
-        pullback = any(
-            candle["low"] <= ema20 + average_atr * 0.20
-            and candle["low"] >= ema50 - average_atr * 0.65
-            for candle in pullback_candles
-        )
-
-        # لا نريد تصحيحاً كسر EMA50 بقوة.
-        invalidated_pullback = any(
-            candle["close"] < ema50 - average_atr * 0.35
-            for candle in pullback_candles
-        )
-
-        recovery = (
-            current["close"] > current["open"]
-            and current["close"] > ema20
-            and current["close"] > previous["high"]
-            and metrics["close_position"] >= 0.72
-            and current_rsi >= 50
-            and current_rsi <= 72
-        )
-
-        if pullback and not invalidated_pullback and recovery:
-            return (
-                "CALL",
-                "Trend Pullback: اتجاه صاعد قوي وتصحيح منظم واستئناف مؤكد"
-            )
-
-    if trend == "DOWN":
-        if structure != "DOWN" or slope20 >= 0:
+        if ema20 <= ema50:
             return None
 
-        if plus_di is None or minus_di is None:
+        # يجب أن تكون هناك حركة صاعدة سابقة،
+        # وليس مجرد تذبذب حول المتوسطات.
+        impulse_candles = candles[-11:-5]
+
+        if len(impulse_candles) < 5:
+            return None
+
+        impulse_move = (
+            impulse_candles[-1]["close"]
+            - impulse_candles[0]["close"]
+        )
+
+        if impulse_move < average_atr * 0.80:
+            return None
+
+        bullish_impulse_candles = sum(
+            1 for candle in impulse_candles
+            if candle["close"] > candle["open"]
+        )
+
+        if bullish_impulse_candles < 3:
+            return None
+
+        # وجود تصحيح حقيقي باتجاه EMA20 أو EMA50.
+        pullback = any(
+            candle["close"] < candle["open"]
+            or candle["close"] < impulse_candles[-1]["close"]
+            for candle in pullback_candles
+        )
+
+        touched_ema_zone = any(
+            candle["low"] <= ema20 + average_atr * 0.20
+            and candle["low"] >= ema50 - average_atr * 0.55
+            for candle in pullback_candles
+        )
+
+        if not pullback or not touched_ema_zone:
+            return None
+
+        # إلغاء الإشارة إذا كسر التصحيح المتوسط50 بقوة.
+        invalidated_pullback = any(
+            candle["close"] < ema50 - average_atr * 0.30
+            for candle in pullback_candles
+        )
+
+        if invalidated_pullback:
+            return None
+
+        # يجب أن تكون شمعة التأكيد صاعدة
+        # وأن تستعيد الزخم بعد التصحيح.
+        bullish_confirmation = (
+            current["close"] > current["open"]
+            and current["close"] > ema20
+            and current["close"] > previous["close"]
+            and metrics["close_position"] >= 0.68
+            and metrics["body_ratio"] >= 0.35
+            and (
+                current["close"] > previous["high"]
+                or (
+                    current["close"] > previous["open"]
+                    and metrics["close_position"] >= 0.78
+                    and metrics["body_ratio"] >= 0.45
+                )
+            )
+        )
+
+        if not bullish_confirmation:
+            return None
+
+        # منع الدخول بعد ابتعاد السعر كثيراً عن EMA20.
+        if current["close"] - ema20 > average_atr * 1.10:
+            return None
+
+        if current_rsi < 48 or current_rsi > 72:
+            return None
+
+        return (
+            "CALL",
+            "Trend Pullback: اتجاه صاعد قوي وحركة سابقة وتصحيح منظم واستئناف مؤكد"
+        )
+
+    # -------------------------------------------------
+    # الاتجاه الهابط
+    # -------------------------------------------------
+
+    if trend == "DOWN":
+
+        if structure != "DOWN" or slope20 >= 0:
             return None
 
         if minus_di <= plus_di:
             return None
 
-        pullback_candles = candles[-5:-1]
+        if ema20 >= ema50:
+            return None
+
+        impulse_candles = candles[-11:-5]
+
+        if len(impulse_candles) < 5:
+            return None
+
+        impulse_move = (
+            impulse_candles[0]["close"]
+            - impulse_candles[-1]["close"]
+        )
+
+        if impulse_move < average_atr * 0.80:
+            return None
+
+        bearish_impulse_candles = sum(
+            1 for candle in impulse_candles
+            if candle["close"] < candle["open"]
+        )
+
+        if bearish_impulse_candles < 3:
+            return None
 
         pullback = any(
-            candle["high"] >= ema20 - average_atr * 0.20
-            and candle["high"] <= ema50 + average_atr * 0.65
+            candle["close"] > candle["open"]
+            or candle["close"] > impulse_candles[-1]["close"]
             for candle in pullback_candles
         )
+
+        touched_ema_zone = any(
+            candle["high"] >= ema20 - average_atr * 0.20
+            and candle["high"] <= ema50 + average_atr * 0.55
+            for candle in pullback_candles
+        )
+
+        if not pullback or not touched_ema_zone:
+            return None
 
         invalidated_pullback = any(
-            candle["close"] > ema50 + average_atr * 0.35
+            candle["close"] > ema50 + average_atr * 0.30
             for candle in pullback_candles
         )
 
-        recovery = (
+        if invalidated_pullback:
+            return None
+
+        bearish_confirmation = (
             current["close"] < current["open"]
             and current["close"] < ema20
-            and current["close"] < previous["low"]
-            and metrics["close_position"] <= 0.28
-            and current_rsi >= 28
-            and current_rsi <= 50
+            and current["close"] < previous["close"]
+            and metrics["close_position"] <= 0.32
+            and metrics["body_ratio"] >= 0.35
+            and (
+                current["close"] < previous["low"]
+                or (
+                    current["close"] < previous["open"]
+                    and metrics["close_position"] <= 0.22
+                    and metrics["body_ratio"] >= 0.45
+                )
+            )
         )
 
-        if pullback and not invalidated_pullback and recovery:
-            return (
-                "PUT",
-                "Trend Pullback: اتجاه هابط قوي وتصحيح منظم واستئناف مؤكد"
-            )
+        if not bearish_confirmation:
+            return None
+
+        if ema20 - current["close"] > average_atr * 1.10:
+            return None
+
+        if current_rsi < 28 or current_rsi > 52:
+            return None
+
+        return (
+            "PUT",
+            "Trend Pullback: اتجاه هابط قوي وحركة سابقة وتصحيح منظم واستئناف مؤكد"
+        )
 
     return None
 
