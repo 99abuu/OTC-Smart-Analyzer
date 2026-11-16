@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import threading
@@ -49,6 +50,9 @@ MAX_CANDLES = 400
 OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
+
+# Rotation offset for candidate market sampling.
+_candidate_rotation_offset = 0
 
 
 def format_time(timestamp):
@@ -399,90 +403,84 @@ def market_score(candles, payout):
 
 
 # --------------------------------------------------
-# BALANCED MARKET CANDIDATE SELECTION
+# ROTATING MARKET CANDIDATE SELECTION
 # --------------------------------------------------
 
 def select_market_candidates(open_symbols, current_symbols=None):
     """
-    Select a payout-diverse candidate sample.
+    Select a payout-diverse rotating candidate sample.
 
-    Payout is used to spread the sample across its range,
-    not to decide the final market ranking.
+    Current active markets receive no automatic priority.
 
-    The final five markets are selected by market_score.
+    The candidate starting point advances by one market
+    on every selection refresh.
+
+    Final market ranking remains based on market_score.
     """
 
-    current_symbols = current_symbols or []
+    global _candidate_rotation_offset
 
     if not open_symbols:
         return []
 
     ordered = sorted(
         open_symbols,
-        key=lambda item: parse_number(item.get("payout")),
-        reverse=True
+        key=lambda item: (
+            -parse_number(item.get("payout")),
+            str(item.get("symbol", ""))
+        )
     )
 
-    by_symbol = {
-        item["symbol"]: item
-        for item in ordered
-    }
+    total_markets = len(ordered)
+
+    target_count = min(
+        MAX_CANDIDATES,
+        total_markets
+    )
+
+    if target_count == 0:
+        return []
+
+    rotation_offset = (
+        _candidate_rotation_offset % total_markets
+    )
+
+    # Rotate the payout-sorted universe.
+    rotated = (
+        ordered[rotation_offset:]
+        + ordered[:rotation_offset]
+    )
+
+    # Spread candidates evenly across the rotated universe.
+    if target_count == 1:
+        indexes = [0]
+    else:
+        indexes = [
+            round(
+                i * total_markets / target_count
+            )
+            for i in range(target_count)
+        ]
 
     selected = []
     seen = set()
 
-    # Retain currently active markets when possible.
-    for symbol in current_symbols:
-        item = by_symbol.get(symbol)
-
-        if item and symbol not in seen:
-            selected.append(item)
-            seen.add(symbol)
-
-    target_count = min(
-        MAX_CANDIDATES,
-        len(ordered)
-    )
-
-    if len(selected) >= target_count:
-        return selected[:target_count]
-
-    remaining_slots = target_count - len(selected)
-
-    # Evenly sample the payout-sorted list.
-    # This prevents the highest payout group from
-    # monopolizing the candidate list.
-    if remaining_slots == 1:
-        indexes = [len(ordered) // 2]
-    else:
-        indexes = [
-            round(
-                i * (len(ordered) - 1)
-                / max(1, remaining_slots - 1)
-            )
-            for i in range(remaining_slots)
-        ]
-
     for index in indexes:
-        item = ordered[index]
-        symbol = item["symbol"]
+        item = rotated[index % total_markets]
+        symbol = item.get("symbol")
 
-        if symbol in seen:
+        if not symbol or symbol in seen:
             continue
 
         selected.append(item)
         seen.add(symbol)
 
-        if len(selected) >= target_count:
-            break
-
-    # Fill any gaps caused by duplicate indexes or
-    # already-retained active markets.
+    # Fill any remaining positions if rounding caused duplicates.
     if len(selected) < target_count:
-        for item in ordered:
-            symbol = item["symbol"]
+        for item in rotated:
+            symbol = item.get("symbol")
 
-            if symbol in seen:
+            if not symbol or symbol in seen:
                 continue
 
             selected.append(item)
@@ -490,6 +488,20 @@ def select_market_candidates(open_symbols, current_symbols=None):
 
             if len(selected) >= target_count:
                 break
+
+    # Advance the rotation for the next refresh.
+    _candidate_rotation_offset = (
+        rotation_offset + 1
+    ) % total_markets
+
+    logger.info(
+        "CANDIDATE ROTATION: offset=%s | "
+        "open_markets=%s | candidates=%s | symbols=%s",
+        rotation_offset,
+        total_markets,
+        len(selected),
+        [item["symbol"] for item in selected]
+    )
 
     return selected
 
@@ -518,9 +530,13 @@ def rank_otc_markets(current_symbols=None):
         return [], {}
 
     candidates = select_market_candidates(
-        open_symbols,
-        current_symbols
+        open_symbols
     )
+
+    candidate_symbols = [
+        item["symbol"]
+        for item in candidates
+    ]
 
     ranked = []
     histories = {}
@@ -531,6 +547,11 @@ def rank_otc_markets(current_symbols=None):
         "Market candidate evaluation: %s candidates from %s open OTC markets",
         len(candidates),
         len(open_symbols)
+    )
+
+    logger.info(
+        "CANDIDATE MARKETS TO EVALUATE: %s",
+        candidate_symbols
     )
 
     for item in candidates:
@@ -590,8 +611,57 @@ def rank_otc_markets(current_symbols=None):
             )
 
     ranked.sort(
-        key=lambda item: item["score"],
-        reverse=True
+        key=lambda item: (
+            -item["score"],
+            item["symbol"]
+        )
+    )
+
+    logger.info(
+        "MARKET EVALUATION RESULTS: %s",
+        [
+            {
+                "symbol": item["symbol"],
+                "score": item["score"],
+                "payout": item["payout"]
+            }
+            for item in ranked
+        ]
+    )
+
+    selected = ranked[:MAX_SYMBOLS]
+
+    old_symbols = set(current_symbols)
+    new_symbols = {
+        item["symbol"]
+        for item in selected
+    }
+
+    entered_symbols = sorted(
+        new_symbols - old_symbols
+    )
+
+    exited_symbols = sorted(
+        old_symbols - new_symbols
+    )
+
+    logger.info(
+        "MARKET SELECTION CHANGES: entered=%s | exited=%s",
+        entered_symbols,
+        exited_symbols
+    )
+
+    logger.info(
+        "FINAL TOP %s MARKETS: %s",
+        MAX_SYMBOLS,
+        [
+            {
+                "symbol": item["symbol"],
+                "score": item["score"],
+                "payout": item["payout"]
+            }
+            for item in selected
+        ]
     )
 
     logger.info(
@@ -600,7 +670,7 @@ def rank_otc_markets(current_symbols=None):
         len(ranked)
     )
 
-    return ranked[:MAX_SYMBOLS], histories
+    return selected, histories
 
 
 # --------------------------------------------------
