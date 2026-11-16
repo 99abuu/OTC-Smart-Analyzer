@@ -1,3 +1,4 @@
+
 import logging
 import time
 from math import isfinite
@@ -9,17 +10,23 @@ EMA_LONG_PERIOD = 200
 ADX_PERIOD = 14
 SIGNAL_COOLDOWN_SECONDS = 3000
 
-# إعدادات مناطق الدعم والمقاومة
+# Support / Resistance
 SR_LOOKBACK = 60
 SR_CLUSTER_ATR = 0.35
 SR_MIN_TOUCHES = 2
 SR_MIN_TOUCH_GAP = 3
 
-# إعدادات الاتجاه القوي
+# Trend
 TREND_ADX_MIN = 20
 TREND_SLOPE_LOOKBACK = 5
 
+# Trend Pullback impulse settings
+PULLBACK_IMPULSE_LOOKBACK = 6
+PULLBACK_MIN_IMPULSE_ATR = 0.55
+PULLBACK_MIN_DIRECTIONAL_CANDLES = 3
+
 _sent = {}
+
 
 def valid_candles(candles):
     if not isinstance(candles, list):
@@ -59,6 +66,7 @@ def valid_candles(candles):
 
     return result
 
+
 def ema(values, period):
     if len(values) < period:
         return None
@@ -73,6 +81,7 @@ def ema(values, period):
         )
 
     return current
+
 
 def rsi(values, period=14):
     if len(values) < period + 1:
@@ -104,6 +113,7 @@ def rsi(values, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+
 def true_ranges(candles):
     ranges = []
 
@@ -119,18 +129,20 @@ def true_ranges(candles):
 
     return ranges
 
+
 def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
 
     ranges = true_ranges(candles)
-
     return sum(ranges[-period:]) / period
+
 
 def adx(candles, period=ADX_PERIOD):
     """
-    Wilder ADX calculation.
-    Returns ADX, +DI and -DI.
+    Wilder ADX.
+    يحسب أول DX من أول مجموعة smoothing صالحة،
+    ثم يطبق Wilder smoothing على قيم DX.
     """
 
     if len(candles) < (period * 2) + 1:
@@ -173,17 +185,30 @@ def adx(candles, period=ADX_PERIOD):
     smooth_plus = sum(plus_dm[:period])
     smooth_minus = sum(minus_dm[:period])
 
-    dx_values = []
-
-    def calculate_di():
+    def calculate_dx():
         if smooth_tr <= 0:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
         plus_di = 100 * smooth_plus / smooth_tr
         minus_di = 100 * smooth_minus / smooth_tr
 
-        return plus_di, minus_di
+        denominator = plus_di + minus_di
 
+        dx = (
+            100 * abs(plus_di - minus_di) / denominator
+            if denominator > 0
+            else 0.0
+        )
+
+        return dx, plus_di, minus_di
+
+    dx_values = []
+
+    # أول DX بعد اكتمال أول فترة smoothing.
+    first_dx, plus_di, minus_di = calculate_dx()
+    dx_values.append(first_dx)
+
+    # Wilder smoothing لبقية الفترات.
     for i in range(period, len(trs)):
         smooth_tr = (
             smooth_tr - smooth_tr / period + trs[i]
@@ -197,15 +222,7 @@ def adx(candles, period=ADX_PERIOD):
             smooth_minus - smooth_minus / period + minus_dm[i]
         )
 
-        plus_di, minus_di = calculate_di()
-        denominator = plus_di + minus_di
-
-        dx = (
-            100 * abs(plus_di - minus_di) / denominator
-            if denominator > 0
-            else 0.0
-        )
-
+        dx, plus_di, minus_di = calculate_dx()
         dx_values.append(dx)
 
     if len(dx_values) < period:
@@ -218,9 +235,8 @@ def adx(candles, period=ADX_PERIOD):
             current_adx * (period - 1) + value
         ) / period
 
-    plus_di, minus_di = calculate_di()
-
     return current_adx, plus_di, minus_di
+
 
 def candle_metrics(candle):
     o = candle["open"]
@@ -246,12 +262,8 @@ def candle_metrics(candle):
         "close_position": (c - l) / full_range
     }
 
-def find_pivots(candles):
-    """
-    اكتشاف القمم والقيعان المحلية.
-    لا يستخدم الشمعة الحالية لتأكيد Pivot.
-    """
 
+def find_pivots(candles):
     highs = []
     lows = []
 
@@ -274,13 +286,8 @@ def find_pivots(candles):
 
     return highs, lows
 
-def market_structure(candles, lookback=45):
-    """
-    يقارن آخر القمم والقيعان المؤكدة.
-    الاتجاه الصاعد يحتاج قمماً أعلى وقيعاناً أعلى.
-    الاتجاه الهابط يحتاج قمماً أدنى وقيعاناً أدنى.
-    """
 
+def market_structure(candles, lookback=45):
     history = candles[-lookback:]
 
     if len(history) < 12:
@@ -311,11 +318,8 @@ def market_structure(candles, lookback=45):
 
     return "MIXED"
 
-def ema_slope(values, period=20, lookback=TREND_SLOPE_LOOKBACK):
-    """
-    يقيس ميل EMA بمقارنة قيمتين محسوبتين من بيانات ماضية.
-    """
 
+def ema_slope(values, period=20, lookback=TREND_SLOPE_LOOKBACK):
     if len(values) < period + lookback + 2:
         return None
 
@@ -326,6 +330,7 @@ def ema_slope(values, period=20, lookback=TREND_SLOPE_LOOKBACK):
         return None
 
     return current_ema - previous_ema
+
 
 def get_trend(candles):
     closes = [c["close"] for c in candles]
@@ -375,12 +380,8 @@ def get_trend(candles):
 
     return "SIDEWAYS", ema20, ema50, ema200
 
-def find_clustered_level(pivots, price, average_atr, direction):
-    """
-    يجمع القمم أو القيعان المتقاربة في منطقة واحدة.
-    يشترط وجود اختبارين منفصلين على الأقل.
-    """
 
+def find_clustered_level(pivots, price, average_atr, direction):
     if not pivots or average_atr is None or average_atr <= 0:
         return None
 
@@ -414,7 +415,9 @@ def find_clustered_level(pivots, price, average_atr, direction):
         if len(distinct) < SR_MIN_TOUCHES:
             continue
 
-        center = sum(item[1] for item in distinct) / len(distinct)
+        center = sum(
+            item[1] for item in distinct
+        ) / len(distinct)
 
         if direction == "SUPPORT" and center > price:
             continue
@@ -422,28 +425,20 @@ def find_clustered_level(pivots, price, average_atr, direction):
         if direction == "RESISTANCE" and center < price:
             continue
 
-        distance = abs(price - center)
-
         candidates.append({
             "level": center,
             "touches": len(distinct),
-            "distance": distance
+            "distance": abs(price - center)
         })
 
     if not candidates:
         return None
 
-    # نختار أقرب منطقة مؤكدة للسعر.
     candidates.sort(key=lambda item: item["distance"])
-
     return candidates[0]
 
-def find_support_resistance(candles, lookback=SR_LOOKBACK):
-    """
-    يرجع مناطق دعم ومقاومة مبنية على Pivot Clusters.
-    لا يخترع مستوى من أقل/أعلى شمعة إذا لم توجد اختبارات كافية.
-    """
 
+def find_support_resistance(candles, lookback=SR_LOOKBACK):
     if len(candles) < 20:
         return None, None
 
@@ -462,30 +457,18 @@ def find_support_resistance(candles, lookback=SR_LOOKBACK):
     highs, lows = find_pivots(history)
 
     support_data = find_clustered_level(
-        lows,
-        price,
-        average_atr,
-        "SUPPORT"
+        lows, price, average_atr, "SUPPORT"
     )
 
     resistance_data = find_clustered_level(
-        highs,
-        price,
-        average_atr,
-        "RESISTANCE"
+        highs, price, average_atr, "RESISTANCE"
     )
 
-    support = (
-        support_data["level"]
-        if support_data else None
-    )
-
-    resistance = (
-        resistance_data["level"]
-        if resistance_data else None
-    )
+    support = support_data["level"] if support_data else None
+    resistance = resistance_data["level"] if resistance_data else None
 
     return support, resistance
+
 
 def strategy_support_rejection(
     candles,
@@ -510,7 +493,6 @@ def strategy_support_rejection(
     tolerance = average_atr * 0.25
     breakout_buffer = average_atr * 0.08
 
-    # الحالة الأولى: كسر كاذب للدعم.
     false_breakout = (
         previous["low"] < support - breakout_buffer
         and previous["close"] < support
@@ -526,7 +508,6 @@ def strategy_support_rejection(
             "Support Rejection: كسر كاذب للدعم وعودة مؤكدة فوق المنطقة"
         )
 
-    # الحالة الثانية: لمس منطقة دعم مع رفض واضح.
     touched_level = (
         current["low"] <= support + tolerance
         and current["low"] >= support - average_atr * 0.35
@@ -548,6 +529,7 @@ def strategy_support_rejection(
         )
 
     return None
+
 
 def strategy_resistance_rejection(
     candles,
@@ -572,7 +554,6 @@ def strategy_resistance_rejection(
     tolerance = average_atr * 0.25
     breakout_buffer = average_atr * 0.08
 
-    # الحالة الأولى: كسر كاذب للمقاومة.
     false_breakout = (
         previous["high"] > resistance + breakout_buffer
         and previous["close"] > resistance
@@ -588,7 +569,6 @@ def strategy_resistance_rejection(
             "Resistance Rejection: كسر كاذب للمقاومة وعودة مؤكدة أسفل المنطقة"
         )
 
-    # الحالة الثانية: لمس مقاومة مع رفض واضح.
     touched_level = (
         current["high"] >= resistance - tolerance
         and current["high"] <= resistance + average_atr * 0.35
@@ -611,6 +591,50 @@ def strategy_resistance_rejection(
 
     return None
 
+
+def check_trend_impulse(candles, direction, average_atr):
+    """
+    يفحص وجود اندفاع سابق يدعم الاتجاه.
+    يستخدم ست شمعات مكتملة قبل شموع التصحيح والتأكيد.
+    """
+
+    if average_atr is None or average_atr <= 0:
+        return False
+
+    start = -(PULLBACK_IMPULSE_LOOKBACK + 5)
+    end = -5
+
+    impulse_candles = candles[start:end]
+
+    if len(impulse_candles) != PULLBACK_IMPULSE_LOOKBACK:
+        return False
+
+    first = impulse_candles[0]
+    last = impulse_candles[-1]
+
+    net_move = (
+        last["close"] - first["open"]
+        if direction == "UP"
+        else first["open"] - last["close"]
+    )
+
+    if net_move < average_atr * PULLBACK_MIN_IMPULSE_ATR:
+        return False
+
+    if direction == "UP":
+        directional_count = sum(
+            1 for candle in impulse_candles
+            if candle["close"] > candle["open"]
+        )
+    else:
+        directional_count = sum(
+            1 for candle in impulse_candles
+            if candle["close"] < candle["open"]
+        )
+
+    return directional_count >= PULLBACK_MIN_DIRECTIONAL_CANDLES
+
+
 def strategy_trend_pullback(
     candles,
     trend,
@@ -620,16 +644,16 @@ def strategy_trend_pullback(
     minus_di=None
 ):
     """
-    اتجاه قوي + تصحيح منظم + استئناف مؤكد.
+    اتجاه قوي + اندفاع سابق + تصحيح منظم + استئناف مؤكد.
     """
 
     if trend not in ("UP", "DOWN"):
         return None
 
-    closes = [c["close"] for c in candles]
-
-    if len(candles) < 55:
+    if len(candles) < 60:
         return None
+
+    closes = [c["close"] for c in candles]
 
     current = candles[-1]
     previous = candles[-2]
@@ -677,7 +701,14 @@ def strategy_trend_pullback(
         if plus_di <= minus_di:
             return None
 
-        # يجب أن يكون هناك تصحيح سابق باتجاه EMA20 أو EMA50.
+        # اندفاع صاعد سابق.
+        if not check_trend_impulse(
+            candles,
+            "UP",
+            average_atr
+        ):
+            return None
+
         pullback_candles = candles[-5:-1]
 
         pullback = any(
@@ -686,7 +717,6 @@ def strategy_trend_pullback(
             for candle in pullback_candles
         )
 
-        # لا نريد تصحيحاً كسر EMA50 بقوة.
         invalidated_pullback = any(
             candle["close"] < ema50 - average_atr * 0.35
             for candle in pullback_candles
@@ -704,7 +734,7 @@ def strategy_trend_pullback(
         if pullback and not invalidated_pullback and recovery:
             return (
                 "CALL",
-                "Trend Pullback: اتجاه صاعد قوي وتصحيح منظم واستئناف مؤكد"
+                "Trend Pullback: اتجاه صاعد قوي مع اندفاع سابق وتصحيح منظم واستئناف مؤكد"
             )
 
     if trend == "DOWN":
@@ -715,6 +745,14 @@ def strategy_trend_pullback(
             return None
 
         if minus_di <= plus_di:
+            return None
+
+        # اندفاع هابط سابق.
+        if not check_trend_impulse(
+            candles,
+            "DOWN",
+            average_atr
+        ):
             return None
 
         pullback_candles = candles[-5:-1]
@@ -742,10 +780,11 @@ def strategy_trend_pullback(
         if pullback and not invalidated_pullback and recovery:
             return (
                 "PUT",
-                "Trend Pullback: اتجاه هابط قوي وتصحيح منظم واستئناف مؤكد"
+                "Trend Pullback: اتجاه هابط قوي مع اندفاع سابق وتصحيح منظم واستئناف مؤكد"
             )
 
     return None
+
 
 def strategy_breakout_retest(candles, average_atr):
     if len(candles) < 35 or average_atr is None:
@@ -809,6 +848,7 @@ def strategy_breakout_retest(candles, average_atr):
 
     return None
 
+
 def calculate_signal_score(
     selected,
     direction,
@@ -822,10 +862,6 @@ def calculate_signal_score(
     minus_di,
     average_atr
 ):
-    """
-    Quality score, not a win probability.
-    """
-
     score = 45.0
 
     strategy_count = len(selected)
@@ -856,7 +892,6 @@ def calculate_signal_score(
         or (direction == "PUT" and trend == "DOWN")
     ):
         score += 7
-
     elif trend in ("UP", "DOWN"):
         score -= 3
 
@@ -914,12 +949,8 @@ def calculate_signal_score(
 
     return round(max(0, min(95, score)), 1)
 
-def select_trade_duration(signal):
-    """
-    Experimental rule-based duration selection.
-    Not an AI model or a win probability.
-    """
 
+def select_trade_duration(signal):
     direction = signal.get("direction")
     trend = signal.get("trend")
     adx_value = signal.get("adx")
@@ -975,6 +1006,7 @@ def select_trade_duration(signal):
         "شروط الاستمرار لمدة دقيقتين غير مكتملة"
     )
 
+
 def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     # التحليل بالكامل على فريم الدقيقة.
     # لا نستخدم بيانات 5m.
@@ -1008,7 +1040,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     trend, ema20, ema50, ema200 = get_trend(candles)
 
     current_rsi = rsi(closes)
-
     current_adx, plus_di, minus_di = adx(candles)
 
     range_ratio = (
@@ -1019,6 +1050,7 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
     support, resistance = find_support_resistance(candles)
 
+    # الاستراتيجيات الأربع مستقلة.
     strategies = [
         strategy_support_rejection(
             candles,
@@ -1072,7 +1104,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
             len(calls),
             len(puts)
         )
-
         return None
 
     selected = calls if calls else puts
@@ -1151,6 +1182,7 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     signal["duration_reason"] = duration_reason
 
     return signal
+
 
 def is_new_signal(signal):
     if not signal:
