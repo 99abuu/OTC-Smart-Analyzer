@@ -47,8 +47,6 @@ HISTORY_1M = 250
 MIN_CANDLES_1M = 200
 MAX_CANDLES = 400
 
-# Both OTC API candles and stream ticks are 2 hours
-# ahead of the UTC server clock.
 OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
@@ -91,19 +89,15 @@ def calculate_outcome(direction, entry_price, exit_price):
     if direction == "CALL":
         if exit_price > entry_price:
             return "WIN"
-
         if exit_price < entry_price:
             return "LOSS"
-
         return "DRAW"
 
     if direction == "PUT":
         if exit_price < entry_price:
             return "WIN"
-
         if exit_price > entry_price:
             return "LOSS"
-
         return "DRAW"
 
     return "DRAW"
@@ -114,11 +108,6 @@ def calculate_outcome(direction, entry_price, exit_price):
 # --------------------------------------------------
 
 def valid_market_candles(candles):
-    """
-    Validate OHLC values while preserving candle timestamps.
-    Timestamps passed here must already be normalized to UTC.
-    """
-
     result = []
 
     if not isinstance(candles, list):
@@ -173,13 +162,6 @@ def valid_market_candles(candles):
 
 
 def normalize_api_candles(raw_candles):
-    """
-    Convert API candle timestamps to UTC.
-
-    API timestamps are approximately 7200 seconds
-    ahead of the UTC server time.
-    """
-
     valid = []
 
     if not isinstance(raw_candles, list):
@@ -208,11 +190,10 @@ def normalize_api_candles(raw_candles):
 
     valid = valid_market_candles(valid)
 
-    # Sort oldest to newest.
     valid.sort(key=lambda item: item["time"])
 
-    # Remove duplicate timestamps.
     unique = {}
+
     for candle in valid:
         unique[candle["time"]] = candle
 
@@ -226,11 +207,6 @@ def has_recent_contiguous_candles(
     candles,
     minimum=MIN_CANDLES_1M
 ):
-    """
-    Verify that the most recent candles form a continuous
-    one-minute sequence without missing timestamps.
-    """
-
     if len(candles) < minimum:
         return False
 
@@ -260,7 +236,6 @@ def add_candle(candles, candle):
     candle_time = candle.get("time")
 
     if candle_time is not None:
-        # Do not add duplicate or older candles.
         for existing in reversed(candles[-5:]):
             if existing.get("time") == candle_time:
                 return
@@ -473,7 +448,6 @@ def rank_otc_markets(current_symbols=None):
     ranked = []
     histories = {}
 
-    # Exclude the currently forming minute candle.
     current_bucket = int(time.time() // 60) * 60
 
     for item in candidates:
@@ -490,7 +464,6 @@ def rank_otc_markets(current_symbols=None):
                 raw_candles
             )
 
-            # Keep completed candles only.
             candles = [
                 candle for candle in candles
                 if candle["time"] < current_bucket
@@ -549,15 +522,6 @@ def fetch_resynchronized_history(
     symbol,
     current_bucket
 ):
-    """
-    Reload recent completed candles from the API.
-
-    The latest expected completed candle must be:
-        current_bucket - 60
-
-    The most recent 200 candles must be continuous.
-    """
-
     try:
         raw_candles = fetch_candles(
             symbol,
@@ -606,8 +570,7 @@ def fetch_resynchronized_history(
             return None
 
         logger.info(
-            "RESYNC SUCCESS: %s | candles=%s | "
-            "latest=%s",
+            "RESYNC SUCCESS: %s | candles=%s | latest=%s",
             symbol,
             len(candles),
             actual_last_time
@@ -646,28 +609,26 @@ def stream_worker(symbols, tick_queue, stop_event):
                     tick_queue.put(event)
 
                 elif event.get("_event") == "closed":
-                    logger.warning(
-                        "OTC stream closed"
-                    )
+                    logger.warning("OTC stream closed")
                     break
 
         except Exception:
-            logger.exception(
-                "OTC stream error"
-            )
+            logger.exception("OTC stream error")
 
         if not stop_event.is_set():
             time.sleep(5)
 
 
 # --------------------------------------------------
-# SIGNAL VALIDATION
+# SIGNAL VALIDATION - LIVE CANDLE SNAPSHOT
 # --------------------------------------------------
 
 def validate_pending_signal(
     alert,
     price,
-    candles_1m
+    candles_1m,
+    current_candle,
+    timestamp
 ):
     if len(candles_1m) < MIN_CANDLES_1M:
         return False, "بيانات الدقيقة غير كافية"
@@ -678,11 +639,64 @@ def validate_pending_signal(
     ):
         return False, "تسلسل بيانات الدقيقة غير مكتمل"
 
+    if not isinstance(current_candle, dict):
+        return False, "الشمعة الحية غير متوفرة"
+
+    live_bucket = parse_number(
+        current_candle.get(
+            "bucket",
+            current_candle.get("time")
+        ),
+        None
+    )
+
+    if live_bucket is None or live_bucket <= 0:
+        return False, "توقيت الشمعة الحية غير صالح"
+
+    live_bucket = int(live_bucket)
+
+    expected_live_bucket = int(timestamp // 60) * 60
+
+    if live_bucket != expected_live_bucket:
+        return False, "الشمعة الحية لا تطابق توقيت السوق الحالي"
+
+    last_history_time = get_last_candle_time(candles_1m)
+
+    if last_history_time is None:
+        return False, "توقيت آخر شمعة مكتملة غير متوفر"
+
+    if live_bucket != last_history_time + 60:
+        return False, "الشمعة الحية غير متصلة بالبيانات السابقة"
+
+    live_snapshot = {
+        "time": live_bucket,
+        "open": current_candle.get("open"),
+        "high": current_candle.get("high"),
+        "low": current_candle.get("low"),
+        "close": current_candle.get("close")
+    }
+
+    validated_live = valid_market_candles(
+        [live_snapshot]
+    )
+
+    if len(validated_live) != 1:
+        return False, "بيانات الشمعة الحية غير صالحة"
+
+    analysis_candles = list(candles_1m)
+    analysis_candles.append(validated_live[0])
+
+    if not has_recent_contiguous_candles(
+        analysis_candles,
+        MIN_CANDLES_1M
+    ):
+        return False, "تسلسل الشموع غير مكتمل وقت التأكيد"
+
     original = alert["signal"]
     direction = original.get("direction")
 
     fresh_signal = analyze_signal(
-        candles_1m,
+        analysis_candles,
         symbol=original.get("symbol")
     )
 
@@ -720,7 +734,7 @@ def validate_pending_signal(
     if movement > 0.002:
         return False, "تحرك السعر بعيداً عن نقطة الإشارة"
 
-    return True, "تم تأكيد الإشارة"
+    return True, "تم تأكيد الإشارة باستخدام الشمعة الحية"
 
 
 # --------------------------------------------------
@@ -755,9 +769,7 @@ async def scanner_loop(send_signal, send_result):
         OTC_TICK_TIME_OFFSET_SECONDS
     )
 
-    logger.info(
-        "Display timezone: Europe/Nicosia"
-    )
+    logger.info("Display timezone: Europe/Nicosia")
 
     selected, initial_histories = await asyncio.to_thread(
         rank_otc_markets,
@@ -765,9 +777,7 @@ async def scanner_loop(send_signal, send_result):
     )
 
     if not selected:
-        logger.error(
-            "No suitable OTC markets found"
-        )
+        logger.error("No suitable OTC markets found")
         return
 
     symbols = [
@@ -790,7 +800,6 @@ async def scanner_loop(send_signal, send_result):
 
     current_1m = {}
 
-    # Each market has its own data-integrity state.
     data_ready = {
         symbol: has_recent_contiguous_candles(
             candles_1m[symbol],
@@ -1054,7 +1063,6 @@ async def scanner_loop(send_signal, send_result):
                 if price <= 0 or raw_timestamp <= 0:
                     continue
 
-                # Normalize stream timestamp to UTC.
                 timestamp = (
                     raw_timestamp
                     - OTC_TICK_TIME_OFFSET_SECONDS
@@ -1172,7 +1180,6 @@ async def scanner_loop(send_signal, send_result):
                                 horizon
                             )
 
-                        # Selected horizon is the primary result.
                         if (
                             horizon
                             == trade["selected_duration_seconds"]
@@ -1277,8 +1284,6 @@ async def scanner_loop(send_signal, send_result):
                 candle = current_1m.get(symbol)
 
                 if candle is None:
-                    # The first live candle must follow the
-                    # latest completed historical candle.
                     last_history_time = get_last_candle_time(
                         candles_1m[symbol]
                     )
@@ -1389,8 +1394,6 @@ async def scanner_loop(send_signal, send_result):
 
                         data_ready[symbol] = False
 
-                    # Any gap or sequence mismatch requires
-                    # a complete API resynchronization.
                     if not data_ready.get(symbol, False):
                         recovered = await asyncio.to_thread(
                             fetch_resynchronized_history,
@@ -1424,7 +1427,6 @@ async def scanner_loop(send_signal, send_result):
                     }
 
                 else:
-                    # Ignore old or out-of-order ticks.
                     continue
 
                 # ----------------------------------
@@ -1459,7 +1461,9 @@ async def scanner_loop(send_signal, send_result):
                         valid, reason = validate_pending_signal(
                             alert,
                             price,
-                            candles_1m[symbol]
+                            candles_1m[symbol],
+                            current_1m.get(symbol),
+                            timestamp
                         )
 
                         if valid:
@@ -1494,9 +1498,7 @@ async def scanner_loop(send_signal, send_result):
                             message["confirmation"] = reason
 
                             try:
-                                delivered = await send_signal(
-                                    message
-                                )
+                                delivered = await send_signal(message)
 
                             except Exception:
                                 logger.exception(
@@ -1714,7 +1716,6 @@ async def scanner_loop(send_signal, send_result):
                 signal["analysis_timeframe"] = "1m"
                 signal["status"] = "PRE_ALERT"
 
-                # Duration is selected once here.
                 (
                     selected_duration,
                     duration_reason
@@ -1734,7 +1735,6 @@ async def scanner_loop(send_signal, send_result):
                     selected_duration // 60
                 )
 
-                # Keep the existing entry schedule unchanged.
                 earliest_entry = (
                     timestamp + PRE_ENTRY_SECONDS
                 )
@@ -1772,41 +1772,24 @@ async def scanner_loop(send_signal, send_result):
 
                 message = dict(signal)
 
-                message["entry_time"] = format_time(
-                    entry_at
-                )
-
-                message["confirm_time"] = format_time(
-                    confirm_at
-                )
-
-                message["duration_seconds"] = (
-                    selected_duration
-                )
-
-                message["selected_duration_seconds"] = (
-                    selected_duration
-                )
-
-                message["duration_reason"] = (
-                    duration_reason
-                )
+                message["entry_time"] = format_time(entry_at)
+                message["confirm_time"] = format_time(confirm_at)
+                message["duration_seconds"] = selected_duration
+                message["selected_duration_seconds"] = selected_duration
+                message["duration_reason"] = duration_reason
 
                 message["exit_time"] = format_time(
                     entry_at + selected_duration
                 )
 
                 try:
-                    delivered = await send_signal(
-                        message
-                    )
+                    delivered = await send_signal(message)
 
                 except Exception:
                     logger.exception(
                         "Pre-alert delivery failed for %s",
                         symbol
                     )
-
                     delivered = False
 
                 if not delivered:
@@ -1815,11 +1798,9 @@ async def scanner_loop(send_signal, send_result):
                         "SIGNAL DISCARDED: %s",
                         symbol
                     )
-
                     continue
 
                 history_id = record_signal(signal)
-
                 alert["history_id"] = history_id
 
                 if history_id:
@@ -1844,11 +1825,9 @@ async def scanner_loop(send_signal, send_result):
                         "signal will not be activated",
                         symbol
                     )
-
                     continue
 
                 pending_alerts[symbol] = alert
-
                 last_signal_time[symbol] = timestamp
 
                 logger.info(
@@ -1862,9 +1841,7 @@ async def scanner_loop(send_signal, send_result):
                 )
 
             except Exception:
-                logger.exception(
-                    "Tick processing failed"
-                )
+                logger.exception("Tick processing failed")
 
     finally:
         stop_event.set()
@@ -1874,6 +1851,4 @@ async def scanner_loop(send_signal, send_result):
             5
         )
 
-        logger.info(
-            "OTC scanner stopped"
-        )
+        logger.info("OTC scanner stopped")
