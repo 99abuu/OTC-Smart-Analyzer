@@ -620,7 +620,7 @@ def stream_worker(symbols, tick_queue, stop_event):
 
 
 # --------------------------------------------------
-# SIGNAL VALIDATION - LIVE CANDLE SNAPSHOT
+# SIGNAL VALIDATION - COMPLETED CANDLES ONLY
 # --------------------------------------------------
 
 def validate_pending_signal(
@@ -683,25 +683,17 @@ def validate_pending_signal(
     if len(validated_live) != 1:
         return False, "بيانات الشمعة الحية غير صالحة"
 
-    analysis_candles = list(candles_1m)
-    analysis_candles.append(validated_live[0])
-
-    if not has_recent_contiguous_candles(
-        analysis_candles,
-        MIN_CANDLES_1M
-    ):
-        return False, "تسلسل الشموع غير مكتمل وقت التأكيد"
-
     original = alert["signal"]
     direction = original.get("direction")
 
+    # استخدام الشموع المكتملة فقط، كما في التحليل الأصلي.
     fresh_signal = analyze_signal(
-        analysis_candles,
+        candles_1m,
         symbol=original.get("symbol")
     )
 
     if not fresh_signal:
-        return False, "لم تعد توجد إشارة مؤكدة"
+        return False, "لم تعد توجد إشارة مؤكدة على الشموع المكتملة"
 
     if fresh_signal.get("direction") != direction:
         return False, "تغير اتجاه الإشارة"
@@ -721,20 +713,25 @@ def validate_pending_signal(
 
     original_price = parse_number(
         original.get("price"),
-        price
+        None
     )
 
-    if original_price <= 0:
+    if original_price is None or original_price <= 0:
         return False, "سعر الإشارة غير صالح"
 
+    live_price = parse_number(price, None)
+
+    if live_price is None or live_price <= 0:
+        return False, "السعر الحالي غير صالح"
+
     movement = abs(
-        price - original_price
+        live_price - original_price
     ) / original_price
 
     if movement > 0.002:
         return False, "تحرك السعر بعيداً عن نقطة الإشارة"
 
-    return True, "تم تأكيد الإشارة باستخدام الشمعة الحية"
+    return True, "تم تأكيد الإشارة مع ثبات الاستراتيجية والسعر"
 
 
 # --------------------------------------------------
