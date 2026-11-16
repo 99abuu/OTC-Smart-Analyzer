@@ -22,8 +22,8 @@ TREND_SLOPE_LOOKBACK = 5
 
 # Trend Pullback impulse settings
 PULLBACK_IMPULSE_LOOKBACK = 6
-PULLBACK_MIN_IMPULSE_ATR = 0.55
-PULLBACK_MIN_DIRECTIONAL_CANDLES = 3
+PULLBACK_MIN_IMPULSE_ATR = 0.35
+PULLBACK_MIN_DIRECTIONAL_CANDLES = 2
 
 _sent = {}
 
@@ -204,11 +204,9 @@ def adx(candles, period=ADX_PERIOD):
 
     dx_values = []
 
-    # أول DX بعد اكتمال أول فترة smoothing.
     first_dx, plus_di, minus_di = calculate_dx()
     dx_values.append(first_dx)
 
-    # Wilder smoothing لبقية الفترات.
     for i in range(period, len(trs)):
         smooth_tr = (
             smooth_tr - smooth_tr / period + trs[i]
@@ -644,14 +642,36 @@ def strategy_trend_pullback(
     minus_di=None
 ):
     """
+    Trend Pullback:
     اتجاه قوي + اندفاع سابق + تصحيح منظم + استئناف مؤكد.
+
+    تحديد اتجاه هذه الاستراتيجية مستقل عن market_structure
+    العام، حتى لا يؤدي تصنيف MIXED إلى منعها تلقائياً.
     """
 
-    if trend not in ("UP", "DOWN"):
+    def reject(reason):
+        logger.debug(
+            "Trend Pullback rejected: %s",
+            reason
+        )
         return None
 
     if len(candles) < 60:
-        return None
+        return reject("not enough candles")
+
+    if average_atr is None or average_atr <= 0:
+        return reject("invalid ATR")
+
+    if current_adx is None:
+        return reject("ADX unavailable")
+
+    if current_adx < TREND_ADX_MIN:
+        return reject(
+            f"ADX too weak: {current_adx:.2f}"
+        )
+
+    if plus_di is None or minus_di is None:
+        return reject("DI unavailable")
 
     closes = [c["close"] for c in candles]
 
@@ -662,128 +682,169 @@ def strategy_trend_pullback(
     ema50 = ema(closes, 50)
     current_rsi = rsi(closes)
     slope20 = ema_slope(closes, 20)
-    structure = market_structure(candles)
 
     if (
         ema20 is None
         or ema50 is None
         or current_rsi is None
-        or average_atr is None
         or slope20 is None
-        or current_adx is None
     ):
-        return None
+        return reject("EMA, RSI or slope unavailable")
 
-    if current_adx < TREND_ADX_MIN:
-        return None
+    # تحديد الاتجاه محلياً لهذه الاستراتيجية.
+    # لا نشترط أن تكون market_structure مثالية.
+    bullish_bias = (
+        ema20 > ema50
+        and slope20 > 0
+        and plus_di > minus_di
+        and current["close"] > ema20 - average_atr * 0.15
+    )
+
+    bearish_bias = (
+        ema20 < ema50
+        and slope20 < 0
+        and minus_di > plus_di
+        and current["close"] < ema20 + average_atr * 0.15
+    )
+
+    if bullish_bias and bearish_bias:
+        return reject("conflicting directional bias")
+
+    if not bullish_bias and not bearish_bias:
+        return reject(
+            "no aligned EMA, slope and DI direction"
+        )
+
+    direction = "UP" if bullish_bias else "DOWN"
 
     metrics = candle_metrics(current)
 
     if not metrics:
-        return None
+        return reject("invalid confirmation candle")
 
-    if metrics["body_ratio"] < 0.40:
-        return None
+    # شروط شمعة التأكيد أصبحت مرنة قليلاً،
+    # مع الاحتفاظ بجسم واضح وحجم حركة معقول.
+    if metrics["body_ratio"] < 0.35:
+        return reject("confirmation body too small")
 
-    if metrics["range"] < average_atr * 0.50:
-        return None
+    if metrics["range"] < average_atr * 0.40:
+        return reject("confirmation range too small")
 
-    if metrics["range"] > average_atr * 2.0:
-        return None
+    if metrics["range"] > average_atr * 2.20:
+        return reject("confirmation candle too large")
 
-    if trend == "UP":
-        if structure != "UP" or slope20 <= 0:
-            return None
+    # فحص الاندفاع السابق.
+    if not check_trend_impulse(
+        candles,
+        direction,
+        average_atr
+    ):
+        return reject(
+            f"{direction} impulse conditions not met"
+        )
 
-        if plus_di is None or minus_di is None:
-            return None
+    pullback_candles = candles[-5:-1]
 
-        if plus_di <= minus_di:
-            return None
-
-        # اندفاع صاعد سابق.
-        if not check_trend_impulse(
-            candles,
-            "UP",
-            average_atr
-        ):
-            return None
-
-        pullback_candles = candles[-5:-1]
-
+    if direction == "UP":
+        # يجب أن يحدث تراجع باتجاه EMA20 أو EMA50.
         pullback = any(
-            candle["low"] <= ema20 + average_atr * 0.20
-            and candle["low"] >= ema50 - average_atr * 0.65
+            candle["low"] <= ema20 + average_atr * 0.35
+            and candle["low"] >= ema50 - average_atr * 0.80
             for candle in pullback_candles
         )
+
+        if not pullback:
+            return reject("no valid bullish pullback to EMA zone")
 
         invalidated_pullback = any(
-            candle["close"] < ema50 - average_atr * 0.35
+            candle["close"] < ema50 - average_atr * 0.50
             for candle in pullback_candles
         )
 
-        recovery = (
+        if invalidated_pullback:
+            return reject("bullish pullback invalidated below EMA50")
+
+        # التأكيد الأساسي: شمعة صاعدة تغلق فوق EMA20.
+        # يسمح باستئناف الزخم دون اشتراط اختراق قمة السابقة دائماً.
+        bullish_candle = (
             current["close"] > current["open"]
             and current["close"] > ema20
-            and current["close"] > previous["high"]
-            and metrics["close_position"] >= 0.72
-            and current_rsi >= 50
-            and current_rsi <= 72
+            and metrics["close_position"] >= 0.62
         )
 
-        if pullback and not invalidated_pullback and recovery:
-            return (
-                "CALL",
-                "Trend Pullback: اتجاه صاعد قوي مع اندفاع سابق وتصحيح منظم واستئناف مؤكد"
-            )
-
-    if trend == "DOWN":
-        if structure != "DOWN" or slope20 >= 0:
-            return None
-
-        if plus_di is None or minus_di is None:
-            return None
-
-        if minus_di <= plus_di:
-            return None
-
-        # اندفاع هابط سابق.
-        if not check_trend_impulse(
-            candles,
-            "DOWN",
-            average_atr
-        ):
-            return None
-
-        pullback_candles = candles[-5:-1]
-
-        pullback = any(
-            candle["high"] >= ema20 - average_atr * 0.20
-            and candle["high"] <= ema50 + average_atr * 0.65
-            for candle in pullback_candles
+        bullish_breakout = (
+            current["close"] > previous["high"]
         )
 
-        invalidated_pullback = any(
-            candle["close"] > ema50 + average_atr * 0.35
-            for candle in pullback_candles
+        bullish_momentum = (
+            current["close"] > previous["close"]
+            and current["close"] > previous["close"] + average_atr * 0.03
         )
 
         recovery = (
-            current["close"] < current["open"]
-            and current["close"] < ema20
-            and current["close"] < previous["low"]
-            and metrics["close_position"] <= 0.28
-            and current_rsi >= 28
-            and current_rsi <= 50
+            bullish_candle
+            and (bullish_breakout or bullish_momentum)
+            and 48 <= current_rsi <= 75
         )
 
-        if pullback and not invalidated_pullback and recovery:
-            return (
-                "PUT",
-                "Trend Pullback: اتجاه هابط قوي مع اندفاع سابق وتصحيح منظم واستئناف مؤكد"
+        if not recovery:
+            return reject(
+                "bullish resumption confirmation not satisfied"
             )
 
-    return None
+        return (
+            "CALL",
+            "Trend Pullback: اتجاه صاعد مع اندفاع سابق وتصحيح نحو EMA واستئناف مؤكد"
+        )
+
+    # الاتجاه الهابط.
+    pullback = any(
+        candle["high"] >= ema20 - average_atr * 0.35
+        and candle["high"] <= ema50 + average_atr * 0.80
+        for candle in pullback_candles
+    )
+
+    if not pullback:
+        return reject("no valid bearish pullback to EMA zone")
+
+    invalidated_pullback = any(
+        candle["close"] > ema50 + average_atr * 0.50
+        for candle in pullback_candles
+    )
+
+    if invalidated_pullback:
+        return reject("bearish pullback invalidated above EMA50")
+
+    bearish_candle = (
+        current["close"] < current["open"]
+        and current["close"] < ema20
+        and metrics["close_position"] <= 0.38
+    )
+
+    bearish_breakout = (
+        current["close"] < previous["low"]
+    )
+
+    bearish_momentum = (
+        current["close"] < previous["close"]
+        and current["close"] < previous["close"] - average_atr * 0.03
+    )
+
+    recovery = (
+        bearish_candle
+        and (bearish_breakout or bearish_momentum)
+        and 25 <= current_rsi <= 52
+    )
+
+    if not recovery:
+        return reject(
+            "bearish resumption confirmation not satisfied"
+        )
+
+    return (
+        "PUT",
+        "Trend Pullback: اتجاه هابط مع اندفاع سابق وتصحيح نحو EMA واستئناف مؤكد"
+    )
 
 
 def strategy_breakout_retest(candles, average_atr):
