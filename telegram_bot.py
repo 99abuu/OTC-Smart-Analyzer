@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import json
@@ -426,6 +427,72 @@ def build_stats_message(data):
         message = message[:3950] + "\n\n... تم اختصار التقرير."
 
     return message
+
+
+# --------------------------------------------------
+# EXPORT TRADE HISTORY
+# --------------------------------------------------
+
+async def export_history(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_controller(update, context):
+        await update.effective_message.reply_text(
+            "❌ هذا الأمر متاح لحساب التحكم فقط.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
+
+    if not HISTORY_FILE.exists():
+        await update.effective_message.reply_text(
+            "❌ لم يتم العثور على ملف سجل الصفقات.\n\n"
+            "المسار المتوقع:\n"
+            f"{HISTORY_FILE}\n\n"
+            "تأكد أن البوت سجّل إشارات على هذا الخادم.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
+
+    try:
+        file_size = HISTORY_FILE.stat().st_size
+
+        if file_size == 0:
+            await update.effective_message.reply_text(
+                "⚠️ ملف سجل الصفقات موجود لكنه فارغ.",
+                reply_markup=MAIN_KEYBOARD
+            )
+            return
+
+        await update.effective_message.reply_text(
+            "📦 جاري تجهيز سجل الصفقات وإرساله..."
+        )
+
+        with HISTORY_FILE.open("rb") as history_file:
+            await update.effective_message.reply_document(
+                document=history_file,
+                filename="trade_history.jsonl",
+                caption=(
+                    "📊 سجل OTC Smart Analyzer\n"
+                    f"حجم الملف: {file_size / 1024:.1f} KB\n"
+                    "هذا هو السجل الخام للإشارات والنتائج."
+                ),
+                reply_markup=MAIN_KEYBOARD
+            )
+
+        logger.info(
+            "Trade history exported to controller user_id=%s",
+            update.effective_user.id
+        )
+
+    except Exception:
+        logger.exception("Trade history export failed")
+
+        await update.effective_message.reply_text(
+            "❌ تعذر إرسال ملف سجل الصفقات.\n"
+            "راجع سجلات تشغيل البوت.",
+            reply_markup=MAIN_KEYBOARD
+        )
 
 
 # --------------------------------------------------
@@ -1141,7 +1208,8 @@ async def start(
         "/markets - اختيار الأسواق\n"
         "/analyze - تحليل يدوي\n"
         "/testsymbols - قائمة الأدوات\n"
-        "/stats - إحصائيات الأداء\n\n"
+        "/stats - إحصائيات الأداء\n"
+        "/exporthistory - استخراج سجل الصفقات\n\n"
     )
 
     if is_new_controller:
@@ -1683,6 +1751,10 @@ def main():
 
     app.add_handler(
         CommandHandler("stats", stats)
+    )
+
+    app.add_handler(
+        CommandHandler("exporthistory", export_history)
     )
 
     app.add_handler(
