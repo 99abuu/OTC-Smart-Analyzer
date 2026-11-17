@@ -29,6 +29,8 @@ from trade_history import (
     record_horizon_result
 )
 
+from ai_model import evaluate_signal
+
 logger = logging.getLogger(__name__)
 
 MAX_SYMBOLS = 5
@@ -118,6 +120,67 @@ async def send_status_message(send_status, message):
         await send_status(message)
     except Exception:
         logger.exception("Status notification failed")
+
+
+# --------------------------------------------------
+# AI SHADOW EVALUATION
+# --------------------------------------------------
+
+def evaluate_ai_shadow(signal):
+    """
+    تقييم الإشارة باستخدام نموذج ML في وضع Shadow فقط.
+
+    لا يغير اتجاه الإشارة أو مدتها.
+    لا يمنع الإشارة.
+    يحفظ التوقعات مع بيانات الإشارة.
+    """
+
+    try:
+        result = evaluate_signal(signal)
+
+        if not isinstance(result, dict):
+            logger.error(
+                "AI returned an invalid result"
+            )
+
+            return {
+                "mode": "SHADOW",
+                "error": "INVALID_AI_RESULT",
+                "predictions": {}
+            }
+
+        predictions = result.get("predictions", {})
+
+        for horizon in (60, 120):
+            prediction = predictions.get(str(horizon), {})
+
+            if not isinstance(prediction, dict):
+                continue
+
+            logger.info(
+                "AI SHADOW: symbol=%s | horizon=%ss | "
+                "status=%s | samples=%s | "
+                "win_probability=%s",
+                signal.get("symbol"),
+                horizon,
+                prediction.get("status"),
+                prediction.get("samples"),
+                prediction.get("win_probability")
+            )
+
+        return result
+
+    except Exception:
+        logger.exception(
+            "AI shadow evaluation failed for %s",
+            signal.get("symbol")
+        )
+
+        return {
+            "mode": "SHADOW",
+            "error": "EVALUATION_FAILED",
+            "predictions": {}
+        }
 
 
 # --------------------------------------------------
@@ -987,6 +1050,7 @@ async def scanner_loop(
     logger.info("Analysis timeframe: 1m only")
     logger.info("Manual market selection enabled")
     logger.info("Trade history recording enabled")
+    logger.info("AI Shadow Mode enabled")
 
     logger.info(
         "Dual-duration comparison enabled: %s seconds",
@@ -1118,7 +1182,6 @@ async def scanner_loop(
             selection_mode = "auto"
 
     selected = initial_selection
-    initial_histories = initial_histories
 
     symbols = [
         item["symbol"]
@@ -2320,6 +2383,16 @@ async def scanner_loop(
                         symbol
                     )
                     continue
+
+                # ----------------------------------
+                # AI SHADOW PREDICTION
+                # ----------------------------------
+
+                signal["ai_shadow"] = evaluate_ai_shadow(signal)
+
+                # ----------------------------------
+                # SAVE SIGNAL AND AI PREDICTION
+                # ----------------------------------
 
                 history_id = record_signal(signal)
                 alert["history_id"] = history_id
