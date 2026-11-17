@@ -51,9 +51,12 @@ OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
 
-# Rotation offset for candidate market sampling.
 _candidate_rotation_offset = 0
 
+
+# --------------------------------------------------
+# GENERAL HELPERS
+# --------------------------------------------------
 
 def format_time(timestamp):
     local_time = datetime.fromtimestamp(
@@ -104,6 +107,17 @@ def calculate_outcome(direction, entry_price, exit_price):
         return "DRAW"
 
     return "DRAW"
+
+
+async def send_status_message(send_status, message):
+    if not send_status:
+        logger.info("SCANNER STATUS: %s", message)
+        return
+
+    try:
+        await send_status(message)
+    except Exception:
+        logger.exception("Status notification failed")
 
 
 # --------------------------------------------------
@@ -192,7 +206,6 @@ def normalize_api_candles(raw_candles):
         valid.append(normalized)
 
     valid = valid_market_candles(valid)
-
     valid.sort(key=lambda item: item["time"])
 
     unique = {}
@@ -407,17 +420,6 @@ def market_score(candles, payout):
 # --------------------------------------------------
 
 def select_market_candidates(open_symbols, current_symbols=None):
-    """
-    Select a payout-diverse rotating candidate sample.
-
-    Current active markets receive no automatic priority.
-
-    The candidate starting point advances by one market
-    on every selection refresh.
-
-    Final market ranking remains based on market_score.
-    """
-
     global _candidate_rotation_offset
 
     if not open_symbols:
@@ -445,20 +447,16 @@ def select_market_candidates(open_symbols, current_symbols=None):
         _candidate_rotation_offset % total_markets
     )
 
-    # Rotate the payout-sorted universe.
     rotated = (
         ordered[rotation_offset:]
         + ordered[:rotation_offset]
     )
 
-    # Spread candidates evenly across the rotated universe.
     if target_count == 1:
         indexes = [0]
     else:
         indexes = [
-            round(
-                i * total_markets / target_count
-            )
+            round(i * total_markets / target_count)
             for i in range(target_count)
         ]
 
@@ -475,7 +473,6 @@ def select_market_candidates(open_symbols, current_symbols=None):
         selected.append(item)
         seen.add(symbol)
 
-    # Fill any remaining positions if rounding caused duplicates.
     if len(selected) < target_count:
         for item in rotated:
             symbol = item.get("symbol")
@@ -489,7 +486,6 @@ def select_market_candidates(open_symbols, current_symbols=None):
             if len(selected) >= target_count:
                 break
 
-    # Advance the rotation for the next refresh.
     _candidate_rotation_offset = (
         rotation_offset + 1
     ) % total_markets
@@ -507,18 +503,16 @@ def select_market_candidates(open_symbols, current_symbols=None):
 
 
 # --------------------------------------------------
-# MARKET SELECTION
+# MARKET DATA HELPERS
 # --------------------------------------------------
 
-def rank_otc_markets(current_symbols=None):
-    current_symbols = current_symbols or []
-
+def get_open_otc_symbols():
     symbols_data = fetch_otc_symbols()
 
     if not symbols_data:
-        return [], {}
+        return []
 
-    open_symbols = [
+    return [
         item for item in symbols_data
         if isinstance(item, dict)
         and item.get("isOtc") is True
@@ -526,12 +520,16 @@ def rank_otc_markets(current_symbols=None):
         and item.get("symbol")
     ]
 
+
+def rank_otc_markets(current_symbols=None):
+    current_symbols = current_symbols or []
+
+    open_symbols = get_open_otc_symbols()
+
     if not open_symbols:
         return [], {}
 
-    candidates = select_market_candidates(
-        open_symbols
-    )
+    candidates = select_market_candidates(open_symbols)
 
     candidate_symbols = [
         item["symbol"]
@@ -564,9 +562,7 @@ def rank_otc_markets(current_symbols=None):
                 HISTORY_1M
             )
 
-            candles = normalize_api_candles(
-                raw_candles
-            )
+            candles = normalize_api_candles(raw_candles)
 
             candles = [
                 candle for candle in candles
@@ -584,14 +580,9 @@ def rank_otc_markets(current_symbols=None):
                 )
                 continue
 
-            payout = parse_number(
-                item.get("payout")
-            )
+            payout = parse_number(item.get("payout"))
 
-            score = market_score(
-                candles,
-                payout
-            )
+            score = market_score(candles, payout)
 
             if score <= 0:
                 continue
@@ -637,18 +628,10 @@ def rank_otc_markets(current_symbols=None):
         for item in selected
     }
 
-    entered_symbols = sorted(
-        new_symbols - old_symbols
-    )
-
-    exited_symbols = sorted(
-        old_symbols - new_symbols
-    )
-
     logger.info(
         "MARKET SELECTION CHANGES: entered=%s | exited=%s",
-        entered_symbols,
-        exited_symbols
+        sorted(new_symbols - old_symbols),
+        sorted(old_symbols - new_symbols)
     )
 
     logger.info(
@@ -673,14 +656,119 @@ def rank_otc_markets(current_symbols=None):
     return selected, histories
 
 
+def load_manual_markets(selected_symbols):
+    """
+    Load only the markets explicitly selected by the user.
+    Invalid or unavailable selections are not automatically replaced.
+    """
+
+    if not isinstance(selected_symbols, (list, tuple)):
+        return [], {}, list(selected_symbols or [])
+
+    selected_symbols = list(dict.fromkeys(
+        str(symbol).strip()
+        for symbol in selected_symbols
+        if symbol
+    ))
+
+    if not selected_symbols:
+        return [], {}, []
+
+    if len(selected_symbols) > MAX_SYMBOLS:
+        raise ValueError(
+            f"الحد الأقصى لاختيار الأسواق هو {MAX_SYMBOLS}"
+        )
+
+    open_symbols = get_open_otc_symbols()
+
+    open_map = {
+        item["symbol"]: item
+        for item in open_symbols
+    }
+
+    selected = []
+    histories = {}
+    unavailable = []
+
+    current_bucket = int(time.time() // 60) * 60
+
+    for symbol in selected_symbols:
+        item = open_map.get(symbol)
+
+        if not item:
+            unavailable.append(symbol)
+            logger.warning(
+                "MANUAL MARKET UNAVAILABLE: %s",
+                symbol
+            )
+            continue
+
+        try:
+            raw_candles = fetch_candles(
+                symbol,
+                60,
+                HISTORY_1M
+            )
+
+            candles = normalize_api_candles(raw_candles)
+
+            candles = [
+                candle for candle in candles
+                if candle["time"] < current_bucket
+            ]
+
+            if not has_recent_contiguous_candles(
+                candles,
+                MIN_CANDLES_1M
+            ):
+                unavailable.append(symbol)
+
+                logger.warning(
+                    "MANUAL MARKET SKIPPED: %s | "
+                    "insufficient or discontinuous candle history",
+                    symbol
+                )
+                continue
+
+            payout = parse_number(item.get("payout"))
+            score = market_score(candles, payout)
+
+            selected.append({
+                "symbol": symbol,
+                "score": score,
+                "payout": payout
+            })
+
+            histories[symbol] = candles[-MAX_CANDLES:]
+
+            logger.info(
+                "MANUAL MARKET LOADED: %s | score=%s | payout=%s",
+                symbol,
+                score,
+                payout
+            )
+
+        except Exception:
+            unavailable.append(symbol)
+            logger.exception(
+                "MANUAL MARKET LOAD FAILED: %s",
+                symbol
+            )
+
+    logger.info(
+        "MANUAL MARKET SELECTION: selected=%s | unavailable=%s",
+        [item["symbol"] for item in selected],
+        unavailable
+    )
+
+    return selected, histories, unavailable
+
+
 # --------------------------------------------------
 # HISTORY RESYNCHRONIZATION
 # --------------------------------------------------
 
-def fetch_resynchronized_history(
-    symbol,
-    current_bucket
-):
+def fetch_resynchronized_history(symbol, current_bucket):
     try:
         raw_candles = fetch_candles(
             symbol,
@@ -688,9 +776,7 @@ def fetch_resynchronized_history(
             HISTORY_1M
         )
 
-        candles = normalize_api_candles(
-            raw_candles
-        )
+        candles = normalize_api_candles(raw_candles)
 
         candles = [
             candle for candle in candles
@@ -738,10 +824,7 @@ def fetch_resynchronized_history(
         return candles[-MAX_CANDLES:]
 
     except Exception:
-        logger.exception(
-            "RESYNC ERROR: %s",
-            symbol
-        )
+        logger.exception("RESYNC ERROR: %s", symbol)
         return None
 
 
@@ -835,9 +918,7 @@ def validate_pending_signal(
         "close": current_candle.get("close")
     }
 
-    validated_live = valid_market_candles(
-        [live_snapshot]
-    )
+    validated_live = valid_market_candles([live_snapshot])
 
     if len(validated_live) != 1:
         return False, "بيانات الشمعة الحية غير صالحة"
@@ -845,7 +926,6 @@ def validate_pending_signal(
     original = alert["signal"]
     direction = original.get("direction")
 
-    # Re-check using completed candles only.
     fresh_signal = analyze_signal(
         candles_1m,
         symbol=original.get("symbol")
@@ -897,10 +977,15 @@ def validate_pending_signal(
 # MAIN SCANNER
 # --------------------------------------------------
 
-async def scanner_loop(send_signal, send_result):
+async def scanner_loop(
+    send_signal,
+    send_result,
+    selection_queue=None,
+    send_status=None
+):
     logger.info("OTC Smart Analyzer starting")
     logger.info("Analysis timeframe: 1m only")
-    logger.info("Dynamic market selection enabled")
+    logger.info("Manual market selection enabled")
     logger.info("Trade history recording enabled")
 
     logger.info(
@@ -927,14 +1012,113 @@ async def scanner_loop(send_signal, send_result):
 
     logger.info("Display timezone: Europe/Nicosia")
 
-    selected, initial_histories = await asyncio.to_thread(
-        rank_otc_markets,
-        []
+    if selection_queue is None:
+        logger.error(
+            "Scanner requires a selection_queue. "
+            "Waiting for Telegram market selection is mandatory."
+        )
+
+        await send_status_message(
+            send_status,
+            "تعذر تشغيل الماسح: قناة اختيار الأسواق غير مهيأة."
+        )
+        return
+
+    # ----------------------------------------------
+    # WAIT FOR INITIAL USER SELECTION
+    # ----------------------------------------------
+
+    await send_status_message(
+        send_status,
+        "الماسح جاهز. اختر الأسواق من Telegram ثم اضغط تأكيد."
     )
 
-    if not selected:
-        logger.error("No suitable OTC markets found")
-        return
+    logger.info("Waiting for initial market selection")
+
+    initial_selection = None
+    selection_mode = None
+
+    while initial_selection is None:
+        try:
+            command = await asyncio.wait_for(
+                selection_queue.get(),
+                timeout=1
+            )
+
+        except asyncio.TimeoutError:
+            continue
+
+        if not isinstance(command, dict):
+            continue
+
+        mode = command.get("mode")
+
+        if mode == "stop":
+            logger.info(
+                "STOP received before scanner startup"
+            )
+            await send_status_message(
+                send_status,
+                "الماسح متوقف. اضغط START لاختيار الأسواق."
+            )
+            return
+
+        if mode == "manual":
+            requested = command.get("symbols", [])
+
+            try:
+                selected, histories, unavailable = (
+                    await asyncio.to_thread(
+                        load_manual_markets,
+                        requested
+                    )
+                )
+
+            except Exception:
+                logger.exception(
+                    "Initial manual market loading failed"
+                )
+                continue
+
+            if unavailable:
+                await send_status_message(
+                    send_status,
+                    "تعذر تحميل بعض الأسواق: "
+                    + ", ".join(unavailable)
+                )
+
+            if not selected:
+                await send_status_message(
+                    send_status,
+                    "لم أتمكن من تحميل أي سوق صالح. "
+                    "اختر أسواقاً أخرى."
+                )
+                continue
+
+            initial_selection = selected
+            initial_histories = histories
+            selection_mode = "manual"
+
+        elif mode == "auto":
+            selected, histories = await asyncio.to_thread(
+                rank_otc_markets,
+                []
+            )
+
+            if not selected:
+                await send_status_message(
+                    send_status,
+                    "لم يتم العثور على أسواق تلقائية صالحة. "
+                    "اختر الأسواق يدوياً أو حاول لاحقاً."
+                )
+                continue
+
+            initial_selection = selected
+            initial_histories = histories
+            selection_mode = "auto"
+
+    selected = initial_selection
+    initial_histories = initial_histories
 
     symbols = [
         item["symbol"]
@@ -942,11 +1126,21 @@ async def scanner_loop(send_signal, send_result):
     ]
 
     logger.info(
+        "Initial market mode: %s",
+        selection_mode
+    )
+
+    logger.info(
         "Selected OTC markets: %s",
         [
             (item["symbol"], item["score"])
             for item in selected
         ]
+    )
+
+    await send_status_message(
+        send_status,
+        "بدأت مراقبة الأسواق: " + ", ".join(symbols)
     )
 
     candles_1m = {
@@ -988,10 +1182,17 @@ async def scanner_loop(send_signal, send_result):
     last_signal_time = {}
 
     pending_selection = None
+    stop_requested = False
 
     next_refresh = (
         time.monotonic() + MARKET_REFRESH_SECONDS
+        if selection_mode == "auto"
+        else float("inf")
     )
+
+    # ----------------------------------------------
+    # CANCEL AN UNENTERED ALERT
+    # ----------------------------------------------
 
     async def cancel_alert(symbol, alert, reason):
         message = dict(alert["signal"])
@@ -1021,9 +1222,14 @@ async def scanner_loop(send_signal, send_result):
 
         pending_alerts.pop(symbol, None)
 
+    # ----------------------------------------------
+    # APPLY A MARKET SELECTION
+    # ----------------------------------------------
+
     async def apply_selection(
         new_selection,
-        new_histories
+        new_histories,
+        new_mode
     ):
         nonlocal symbols
         nonlocal tick_queue
@@ -1032,6 +1238,8 @@ async def scanner_loop(send_signal, send_result):
         nonlocal candles_1m
         nonlocal current_1m
         nonlocal data_ready
+        nonlocal selection_mode
+        nonlocal next_refresh
 
         new_symbols = [
             item["symbol"]
@@ -1041,15 +1249,23 @@ async def scanner_loop(send_signal, send_result):
         if not new_symbols:
             return False
 
-        if new_symbols == symbols:
-            logger.info(
-                "Market selection unchanged: %s",
-                symbols
-            )
-            return True
-
         if pending_alerts or pending_trades:
             return False
+
+        if new_symbols == symbols:
+            selection_mode = new_mode
+
+            next_refresh = (
+                time.monotonic() + MARKET_REFRESH_SECONDS
+                if new_mode == "auto"
+                else float("inf")
+            )
+
+            logger.info(
+                "Market list unchanged; mode updated to %s",
+                new_mode
+            )
+            return True
 
         logger.info(
             "Changing OTC markets: %s -> %s",
@@ -1067,11 +1283,14 @@ async def scanner_loop(send_signal, send_result):
         if worker.is_alive():
             logger.warning(
                 "Old stream has not stopped yet; "
-                "market rotation postponed"
+                "market selection postponed"
             )
+
+            stop_event.clear()
             return False
 
         symbols = new_symbols
+        selection_mode = new_mode
 
         candles_1m = {
             symbol: new_histories.get(symbol, [])
@@ -1099,43 +1318,254 @@ async def scanner_loop(send_signal, send_result):
 
         worker.start()
 
+        next_refresh = (
+            time.monotonic() + MARKET_REFRESH_SECONDS
+            if new_mode == "auto"
+            else float("inf")
+        )
+
         logger.info(
-            "New OTC markets active: %s",
+            "New OTC markets active: %s | mode=%s",
             [
                 (item["symbol"], item["score"])
                 for item in new_selection
-            ]
+            ],
+            selection_mode
+        )
+
+        await send_status_message(
+            send_status,
+            "تم تحديث الأسواق: " + ", ".join(symbols)
         )
 
         return True
 
+    # ----------------------------------------------
+    # CONTROL QUEUE
+    # ----------------------------------------------
+
+    async def process_control_commands():
+        nonlocal pending_selection
+        nonlocal stop_requested
+
+        while True:
+            try:
+                command = selection_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if not isinstance(command, dict):
+                continue
+
+            mode = command.get("mode")
+
+            if mode == "stop":
+                if not stop_requested:
+                    stop_requested = True
+
+                    logger.info(
+                        "STOP requested: preventing new signals"
+                    )
+
+                    await send_status_message(
+                        send_status,
+                        "تم طلب الإيقاف. لن تصدر إشارات جديدة، "
+                        "وسأنتظر انتهاء الصفقات التجريبية المفتوحة."
+                    )
+
+                    for symbol, alert in list(
+                        pending_alerts.items()
+                    ):
+                        await cancel_alert(
+                            symbol,
+                            alert,
+                            "إيقاف الماسح بطلب المستخدم قبل الدخول"
+                        )
+
+                    pending_selection = None
+
+                continue
+
+            if stop_requested:
+                logger.info(
+                    "Ignoring selection command while stopping"
+                )
+                continue
+
+            if mode == "manual":
+                requested = command.get("symbols", [])
+
+                if not requested:
+                    await send_status_message(
+                        send_status,
+                        "لم يتم إرسال أي سوق للاختيار."
+                    )
+                    continue
+
+                try:
+                    new_selection, new_histories, unavailable = (
+                        await asyncio.to_thread(
+                            load_manual_markets,
+                            requested
+                        )
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Manual market selection failed"
+                    )
+                    continue
+
+                if unavailable:
+                    await send_status_message(
+                        send_status,
+                        "تعذر تحميل بعض الأسواق: "
+                        + ", ".join(unavailable)
+                    )
+
+                if not new_selection:
+                    await send_status_message(
+                        send_status,
+                        "لم يتم تطبيق الاختيار؛ لا توجد أسواق صالحة."
+                    )
+                    continue
+
+                if pending_alerts or pending_trades:
+                    pending_selection = (
+                        new_selection,
+                        new_histories,
+                        "manual"
+                    )
+
+                    logger.info(
+                        "Manual market change postponed "
+                        "until pending alerts/trades finish"
+                    )
+
+                    await send_status_message(
+                        send_status,
+                        "تم استلام اختيار الأسواق. "
+                        "سيتم تطبيقه بعد انتهاء الإشارات والصفقات الحالية."
+                    )
+
+                else:
+                    applied = await apply_selection(
+                        new_selection,
+                        new_histories,
+                        "manual"
+                    )
+
+                    if not applied:
+                        pending_selection = (
+                            new_selection,
+                            new_histories,
+                            "manual"
+                        )
+
+                continue
+
+            if mode == "auto":
+                try:
+                    new_selection, new_histories = (
+                        await asyncio.to_thread(
+                            rank_otc_markets,
+                            symbols
+                        )
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Automatic market selection failed"
+                    )
+                    continue
+
+                if not new_selection:
+                    await send_status_message(
+                        send_status,
+                        "لم يتم العثور على أسواق تلقائية صالحة."
+                    )
+                    continue
+
+                if pending_alerts or pending_trades:
+                    pending_selection = (
+                        new_selection,
+                        new_histories,
+                        "auto"
+                    )
+
+                    await send_status_message(
+                        send_status,
+                        "سيتم تفعيل الاختيار التلقائي "
+                        "بعد انتهاء الصفقات الحالية."
+                    )
+
+                else:
+                    applied = await apply_selection(
+                        new_selection,
+                        new_histories,
+                        "auto"
+                    )
+
+                    if not applied:
+                        pending_selection = (
+                            new_selection,
+                            new_histories,
+                            "auto"
+                        )
+
+    # ----------------------------------------------
+    # MAIN LOOP
+    # ----------------------------------------------
+
     try:
         while True:
 
+            await process_control_commands()
+
             # --------------------------------------
-            # PERIODIC MARKET REFRESH
+            # SAFE STOP
             # --------------------------------------
 
-            if time.monotonic() >= next_refresh:
+            if stop_requested:
+                if not pending_trades:
+                    logger.info(
+                        "STOP completed: no pending paper trades"
+                    )
+
+                    await send_status_message(
+                        send_status,
+                        "تم إيقاف الماسح بعد تسوية الصفقات التجريبية."
+                    )
+                    break
+
+            # --------------------------------------
+            # PERIODIC AUTO MARKET REFRESH
+            # --------------------------------------
+
+            if (
+                not stop_requested
+                and selection_mode == "auto"
+                and time.monotonic() >= next_refresh
+            ):
                 next_refresh = (
                     time.monotonic()
                     + MARKET_REFRESH_SECONDS
                 )
 
                 try:
-                    (
-                        new_selection,
-                        new_histories
-                    ) = await asyncio.to_thread(
-                        rank_otc_markets,
-                        symbols
+                    new_selection, new_histories = (
+                        await asyncio.to_thread(
+                            rank_otc_markets,
+                            symbols
+                        )
                     )
 
                     if new_selection:
                         if pending_alerts or pending_trades:
                             pending_selection = (
                                 new_selection,
-                                new_histories
+                                new_histories,
+                                "auto"
                             )
 
                             logger.info(
@@ -1146,13 +1576,15 @@ async def scanner_loop(send_signal, send_result):
                         else:
                             applied = await apply_selection(
                                 new_selection,
-                                new_histories
+                                new_histories,
+                                "auto"
                             )
 
                             if not applied:
                                 pending_selection = (
                                     new_selection,
-                                    new_histories
+                                    new_histories,
+                                    "auto"
                                 )
 
                     else:
@@ -1171,18 +1603,21 @@ async def scanner_loop(send_signal, send_result):
             # --------------------------------------
 
             if (
-                pending_selection
+                not stop_requested
+                and pending_selection
                 and not pending_alerts
                 and not pending_trades
             ):
                 (
                     new_selection,
-                    new_histories
+                    new_histories,
+                    new_mode
                 ) = pending_selection
 
                 applied = await apply_selection(
                     new_selection,
-                    new_histories
+                    new_histories,
+                    new_mode
                 )
 
                 if applied:
@@ -1208,13 +1643,8 @@ async def scanner_loop(send_signal, send_result):
                 if symbol not in symbols:
                     continue
 
-                price = parse_number(
-                    tick.get("price")
-                )
-
-                raw_timestamp = parse_number(
-                    tick.get("time")
-                )
+                price = parse_number(tick.get("price"))
+                raw_timestamp = parse_number(tick.get("time"))
 
                 if price <= 0 or raw_timestamp <= 0:
                     continue
@@ -1227,9 +1657,7 @@ async def scanner_loop(send_signal, send_result):
                 if timestamp <= 0:
                     continue
 
-                minute_bucket = (
-                    int(timestamp // 60) * 60
-                )
+                minute_bucket = int(timestamp // 60) * 60
 
                 # ----------------------------------
                 # PAPER TRADE RESULT PROCESSING
@@ -1272,10 +1700,7 @@ async def scanner_loop(send_signal, send_result):
                                 delay
                             )
 
-                            trade["processed_horizons"].add(
-                                horizon
-                            )
-
+                            trade["processed_horizons"].add(horizon)
                             continue
 
                         outcome = calculate_outcome(
@@ -1287,10 +1712,7 @@ async def scanner_loop(send_signal, send_result):
                         horizon_details = {
                             "symbol": symbol,
                             "direction": trade["direction"],
-                            "strategies": trade.get(
-                                "strategies",
-                                []
-                            ),
+                            "strategies": trade.get("strategies", []),
                             "strategy_reasons": trade.get(
                                 "strategy_reasons",
                                 []
@@ -1315,9 +1737,7 @@ async def scanner_loop(send_signal, send_result):
                         )
 
                         if saved:
-                            trade["processed_horizons"].add(
-                                horizon
-                            )
+                            trade["processed_horizons"].add(horizon)
 
                             logger.info(
                                 "HORIZON RESULT: %s | %ss | %s | "
@@ -1338,8 +1758,7 @@ async def scanner_loop(send_signal, send_result):
                             )
 
                         if (
-                            horizon
-                            == trade["selected_duration_seconds"]
+                            horizon == trade["selected_duration_seconds"]
                             and saved
                             and not trade.get("primary_result_saved")
                         ):
@@ -1351,19 +1770,14 @@ async def scanner_loop(send_signal, send_result):
                                 "entry_time": format_time(
                                     trade["entry_time"]
                                 ),
-                                "exit_time": format_time(
-                                    timestamp
-                                ),
+                                "exit_time": format_time(timestamp),
                                 "result": outcome,
                                 "duration_seconds": horizon,
                                 "duration_reason": trade.get(
                                     "duration_reason",
                                     ""
                                 ),
-                                "strategies": trade.get(
-                                    "strategies",
-                                    []
-                                ),
+                                "strategies": trade.get("strategies", []),
                                 "strategy_reasons": trade.get(
                                     "strategy_reasons",
                                     []
@@ -1383,7 +1797,6 @@ async def scanner_loop(send_signal, send_result):
 
                                 try:
                                     await send_result(result_data)
-
                                 except Exception:
                                     logger.exception(
                                         "Selected-duration result "
@@ -1415,9 +1828,7 @@ async def scanner_loop(send_signal, send_result):
                             trade.get("history_id"),
                             "DURATION_COMPARISON_COMPLETED",
                             {
-                                "durations": list(
-                                    COMPARISON_DURATIONS
-                                ),
+                                "durations": list(COMPARISON_DURATIONS),
                                 "selected_duration_seconds": trade[
                                     "selected_duration_seconds"
                                 ]
@@ -1429,10 +1840,7 @@ async def scanner_loop(send_signal, send_result):
                             symbol
                         )
 
-                        pending_trades.pop(
-                            symbol,
-                            None
-                        )
+                        pending_trades.pop(symbol, None)
 
                 # ----------------------------------
                 # BUILD LIVE ONE-MINUTE CANDLES
@@ -1445,9 +1853,7 @@ async def scanner_loop(send_signal, send_result):
                         candles_1m[symbol]
                     )
 
-                    expected_previous_time = (
-                        minute_bucket - 60
-                    )
+                    expected_previous_time = minute_bucket - 60
 
                     if last_history_time != expected_previous_time:
                         logger.warning(
@@ -1467,7 +1873,6 @@ async def scanner_loop(send_signal, send_result):
                         if recovered is not None:
                             candles_1m[symbol] = recovered
                             data_ready[symbol] = True
-
                         else:
                             data_ready[symbol] = False
 
@@ -1483,16 +1888,8 @@ async def scanner_loop(send_signal, send_result):
                     continue
 
                 if minute_bucket == candle["bucket"]:
-                    candle["high"] = max(
-                        candle["high"],
-                        price
-                    )
-
-                    candle["low"] = min(
-                        candle["low"],
-                        price
-                    )
-
+                    candle["high"] = max(candle["high"], price)
+                    candle["low"] = min(candle["low"], price)
                     candle["close"] = price
 
                 elif minute_bucket > candle["bucket"]:
@@ -1501,16 +1898,16 @@ async def scanner_loop(send_signal, send_result):
                         minute_bucket - candle["bucket"]
                     )
 
-                    if gap_seconds == 60 and data_ready.get(symbol, False):
-
+                    if (
+                        gap_seconds == 60
+                        and data_ready.get(symbol, False)
+                    ):
                         expected_previous_history = (
                             candle["bucket"] - 60
                         )
 
                         actual_previous_history = (
-                            get_last_candle_time(
-                                candles_1m[symbol]
-                            )
+                            get_last_candle_time(candles_1m[symbol])
                         )
 
                         if (
@@ -1656,7 +2053,6 @@ async def scanner_loop(send_signal, send_result):
 
                             try:
                                 delivered = await send_signal(message)
-
                             except Exception:
                                 logger.exception(
                                     "Entry confirmation delivery failed: %s",
@@ -1670,17 +2066,13 @@ async def scanner_loop(send_signal, send_result):
                                     "ENTRY_NOT_DELIVERED"
                                 )
 
-                                pending_alerts.pop(
-                                    symbol,
-                                    None
-                                )
+                                pending_alerts.pop(symbol, None)
 
                                 logger.warning(
                                     "ENTRY CONFIRMATION NOT DELIVERED; "
                                     "PAPER TRADE BLOCKED: %s",
                                     symbol
                                 )
-
                                 continue
 
                             alert["status"] = "CONFIRMED"
@@ -1691,9 +2083,7 @@ async def scanner_loop(send_signal, send_result):
                                 {
                                     "confirmation": reason,
                                     "confirmation_price": price,
-                                    "planned_entry_time": alert[
-                                        "entry_at"
-                                    ],
+                                    "planned_entry_time": alert["entry_at"],
                                     "selected_duration_seconds": alert[
                                         "selected_duration_seconds"
                                     ],
@@ -1717,7 +2107,6 @@ async def scanner_loop(send_signal, send_result):
                                 alert,
                                 reason
                             )
-
                             continue
 
                     # ----------------------------------
@@ -1730,9 +2119,7 @@ async def scanner_loop(send_signal, send_result):
                         and timestamp >= alert["entry_at"]
                     ):
 
-                        delay = (
-                            timestamp - alert["entry_at"]
-                        )
+                        delay = timestamp - alert["entry_at"]
 
                         if delay > MAX_ENTRY_DELAY:
                             await cancel_alert(
@@ -1762,16 +2149,10 @@ async def scanner_loop(send_signal, send_result):
                             "entry_price": price,
                             "entry_time": timestamp,
                             "strategies": list(
-                                signal.get(
-                                    "matching_strategies",
-                                    []
-                                )
+                                signal.get("matching_strategies", [])
                             ),
                             "strategy_reasons": list(
-                                signal.get(
-                                    "strategy_reasons",
-                                    []
-                                )
+                                signal.get("strategy_reasons", [])
                             ),
                             "history_id": alert.get("history_id"),
                             "selected_duration_seconds": selected_duration,
@@ -1804,16 +2185,16 @@ async def scanner_loop(send_signal, send_result):
                             selected_duration
                         )
 
-                        pending_alerts.pop(
-                            symbol,
-                            None
-                        )
-
+                        pending_alerts.pop(symbol, None)
                         continue
 
                 # ----------------------------------
                 # DO NOT ANALYZE DURING OPEN TRADE
+                # OR AFTER STOP REQUEST
                 # ----------------------------------
+
+                if stop_requested:
+                    continue
 
                 if symbol in pending_trades:
                     continue
@@ -1842,7 +2223,6 @@ async def scanner_loop(send_signal, send_result):
                         "recent candle sequence is not continuous",
                         symbol
                     )
-
                     continue
 
                 # ----------------------------------
@@ -1860,10 +2240,7 @@ async def scanner_loop(send_signal, send_result):
                 if not is_new_signal(signal):
                     continue
 
-                previous_time = last_signal_time.get(
-                    symbol,
-                    0
-                )
+                previous_time = last_signal_time.get(symbol, 0)
 
                 if timestamp - previous_time < 60:
                     continue
@@ -1878,31 +2255,18 @@ async def scanner_loop(send_signal, send_result):
                     duration_reason
                 ) = select_trade_duration(signal)
 
-                signal["selected_duration_seconds"] = (
-                    selected_duration
-                )
-
-                signal["duration_seconds"] = (
-                    selected_duration
-                )
-
+                signal["selected_duration_seconds"] = selected_duration
+                signal["duration_seconds"] = selected_duration
                 signal["duration_reason"] = duration_reason
+                signal["expiry_minutes"] = selected_duration // 60
 
-                signal["expiry_minutes"] = (
-                    selected_duration // 60
-                )
-
-                earliest_entry = (
-                    timestamp + PRE_ENTRY_SECONDS
-                )
+                earliest_entry = timestamp + PRE_ENTRY_SECONDS
 
                 entry_at = (
                     (int(earliest_entry) + 59) // 60
                 ) * 60
 
-                confirm_at = (
-                    entry_at - CONFIRM_BEFORE_ENTRY
-                )
+                confirm_at = entry_at - CONFIRM_BEFORE_ENTRY
 
                 alert = {
                     "signal": signal,
@@ -1942,7 +2306,6 @@ async def scanner_loop(send_signal, send_result):
 
                 try:
                     delivered = await send_signal(message)
-
                 except Exception:
                     logger.exception(
                         "Pre-alert delivery failed for %s",
