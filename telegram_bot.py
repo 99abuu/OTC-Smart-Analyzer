@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import json
@@ -480,15 +479,11 @@ async def start_scanner_task(app):
 
     if selection_queue is None:
         selection_queue = asyncio.Queue()
-
         app.bot_data["selection_queue"] = selection_queue
 
     async def notify(signal):
         phase = signal_phase(signal)
-
-        strategies_text = format_signal_details(
-            signal
-        )
+        strategies_text = format_signal_details(signal)
 
         duration_label, duration_reason = format_duration(
             signal
@@ -578,7 +573,6 @@ async def start_scanner_task(app):
                 "Unknown signal phase/status: %s",
                 phase
             )
-
             return False
 
         return await send_to_subscribers(
@@ -673,7 +667,6 @@ async def queue_selection(app, selection):
         app.bot_data["selection_queue"] = selection_queue
 
     await start_scanner_task(app)
-
     await selection_queue.put(selection)
 
 
@@ -742,7 +735,9 @@ def build_market_keyboard(markets, selected, page):
     for index in range(0, len(page_markets), 2):
         row = []
 
-        for item in page_markets[index:index + 2]:
+        for offset, item in enumerate(
+            page_markets[index:index + 2]
+        ):
             symbol = item["symbol"]
 
             marker = (
@@ -751,13 +746,12 @@ def build_market_keyboard(markets, selected, page):
                 else ""
             )
 
+            market_index = start_index + index + offset
+
             row.append(
                 InlineKeyboardButton(
                     f"{marker}{symbol}",
-                    callback_data=(
-                        f"mkt:toggle:{start_index + index + "
-                        f"page_markets[index:index + 2].index(item)}"
-                    )
+                    callback_data=f"mkt:toggle:{market_index}"
                 )
             )
 
@@ -841,7 +835,6 @@ async def show_market_picker(
     try:
         if refresh or "available_markets" not in context.user_data:
             markets = await fetch_open_markets()
-
             context.user_data["available_markets"] = markets
 
         else:
@@ -863,9 +856,7 @@ async def show_market_picker(
             )
 
             if update.callback_query:
-                await update.callback_query.edit_message_text(
-                    text
-                )
+                await update.callback_query.edit_message_text(text)
             else:
                 await update.effective_message.reply_text(
                     text,
@@ -939,14 +930,14 @@ async def market_callback(
 ):
     query = update.callback_query
 
-    await query.answer()
-
     if not is_controller(update, context):
         await query.answer(
             "ليس لديك صلاحية التحكم بالبوت.",
             show_alert=True
         )
         return
+
+    await query.answer()
 
     data = query.data or ""
 
@@ -1054,20 +1045,19 @@ async def market_callback(
             )
             return
 
+        selection = {
+            "mode": "manual",
+            "symbols": list(selected)
+        }
+
         await queue_selection(
             context.application,
-            {
-                "mode": "manual",
-                "symbols": list(selected)
-            }
+            selection
         )
 
         context.application.bot_data[
             "last_selection"
-        ] = {
-            "mode": "manual",
-            "symbols": list(selected)
-        }
+        ] = selection
 
         await query.edit_message_text(
             "✅ تم إرسال اختيار الأسواق إلى الماسح.\n\n"
@@ -1079,18 +1069,18 @@ async def market_callback(
         return
 
     if data == "mkt:auto":
+        selection = {
+            "mode": "auto"
+        }
+
         await queue_selection(
             context.application,
-            {
-                "mode": "auto"
-            }
+            selection
         )
 
         context.application.bot_data[
             "last_selection"
-        ] = {
-            "mode": "auto"
-        }
+        ] = selection
 
         await query.edit_message_text(
             "⚡ تم تفعيل الاختيار التلقائي.\n\n"
