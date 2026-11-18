@@ -16,6 +16,10 @@ SR_CLUSTER_ATR = 0.35
 SR_MIN_TOUCHES = 2
 SR_MIN_TOUCH_GAP = 3
 
+# Minimum available room before the opposing S/R level.
+# A rejection signal is ignored when the opposite level is too close.
+SR_MIN_OPPOSING_ROOM_ATR = 0.80
+
 # Trend
 TREND_ADX_MIN = 20
 TREND_SLOPE_LOOKBACK = 5
@@ -24,6 +28,9 @@ TREND_SLOPE_LOOKBACK = 5
 PULLBACK_IMPULSE_LOOKBACK = 6
 PULLBACK_MIN_IMPULSE_ATR = 0.35
 PULLBACK_MIN_DIRECTIONAL_CANDLES = 2
+
+# Avoid chasing a pullback confirmation too far from EMA20.
+PULLBACK_MAX_EMA_EXTENSION_ATR = 0.90
 
 _sent = {}
 
@@ -141,8 +148,6 @@ def atr(candles, period=14):
 def adx(candles, period=ADX_PERIOD):
     """
     Wilder ADX.
-    يحسب أول DX من أول مجموعة smoothing صالحة،
-    ثم يطبق Wilder smoothing على قيم DX.
     """
 
     if len(candles) < (period * 2) + 1:
@@ -468,6 +473,39 @@ def find_support_resistance(candles, lookback=SR_LOOKBACK):
     return support, resistance
 
 
+def has_opposing_level_room(
+    price,
+    opposing_level,
+    average_atr,
+    direction
+):
+    """
+    يتأكد من وجود مساحة كافية بين سعر الدخول والمنطقة المقابلة.
+
+    CALL: المسافة من السعر إلى المقاومة.
+    PUT: المسافة من السعر إلى الدعم.
+
+    إذا لم تتوفر منطقة مقابلة، لا يرفض الإشارة لهذا السبب وحده.
+    """
+
+    if opposing_level is None:
+        return True
+
+    if average_atr is None or average_atr <= 0:
+        return False
+
+    if direction == "CALL":
+        room = opposing_level - price
+    elif direction == "PUT":
+        room = price - opposing_level
+    else:
+        return False
+
+    required_room = average_atr * SR_MIN_OPPOSING_ROOM_ATR
+
+    return room >= required_room
+
+
 def strategy_support_rejection(
     candles,
     support,
@@ -500,7 +538,24 @@ def strategy_support_rejection(
         and metrics["close_position"] >= 0.70
     )
 
+    bullish_rejection = (
+        current["close"] > current["open"]
+        and current["close"] > support + average_atr * 0.03
+        and metrics["lower_wick"] >= metrics["body"] * 1.3
+        and metrics["lower_wick"] >= metrics["range"] * 0.28
+        and metrics["close_position"] >= 0.68
+        and metrics["body_ratio"] >= 0.18
+    )
+
     if false_breakout:
+        if not has_opposing_level_room(
+            current["close"],
+            resistance,
+            average_atr,
+            "CALL"
+        ):
+            return None
+
         return (
             "CALL",
             "Support Rejection: كسر كاذب للدعم وعودة مؤكدة فوق المنطقة"
@@ -511,16 +566,15 @@ def strategy_support_rejection(
         and current["low"] >= support - average_atr * 0.35
     )
 
-    bullish_rejection = (
-        current["close"] > current["open"]
-        and current["close"] > support + average_atr * 0.03
-        and metrics["lower_wick"] >= metrics["body"] * 1.3
-        and metrics["lower_wick"] >= metrics["range"] * 0.28
-        and metrics["close_position"] >= 0.68
-        and metrics["body_ratio"] >= 0.18
-    )
-
     if touched_level and bullish_rejection:
+        if not has_opposing_level_room(
+            current["close"],
+            resistance,
+            average_atr,
+            "CALL"
+        ):
+            return None
+
         return (
             "CALL",
             "Support Rejection: اختبار منطقة دعم متعددة اللمسات ورفض سعري"
@@ -561,7 +615,24 @@ def strategy_resistance_rejection(
         and metrics["close_position"] <= 0.30
     )
 
+    bearish_rejection = (
+        current["close"] < current["open"]
+        and current["close"] < resistance - average_atr * 0.03
+        and metrics["upper_wick"] >= metrics["body"] * 1.3
+        and metrics["upper_wick"] >= metrics["range"] * 0.28
+        and metrics["close_position"] <= 0.32
+        and metrics["body_ratio"] >= 0.18
+    )
+
     if false_breakout:
+        if not has_opposing_level_room(
+            current["close"],
+            support,
+            average_atr,
+            "PUT"
+        ):
+            return None
+
         return (
             "PUT",
             "Resistance Rejection: كسر كاذب للمقاومة وعودة مؤكدة أسفل المنطقة"
@@ -572,16 +643,15 @@ def strategy_resistance_rejection(
         and current["high"] <= resistance + average_atr * 0.35
     )
 
-    bearish_rejection = (
-        current["close"] < current["open"]
-        and current["close"] < resistance - average_atr * 0.03
-        and metrics["upper_wick"] >= metrics["body"] * 1.3
-        and metrics["upper_wick"] >= metrics["range"] * 0.28
-        and metrics["close_position"] <= 0.32
-        and metrics["body_ratio"] >= 0.18
-    )
-
     if touched_level and bearish_rejection:
+        if not has_opposing_level_room(
+            current["close"],
+            support,
+            average_atr,
+            "PUT"
+        ):
+            return None
+
         return (
             "PUT",
             "Resistance Rejection: اختبار منطقة مقاومة متعددة اللمسات ورفض سعري"
@@ -645,8 +715,8 @@ def strategy_trend_pullback(
     Trend Pullback:
     اتجاه قوي + اندفاع سابق + تصحيح منظم + استئناف مؤكد.
 
-    تحديد اتجاه هذه الاستراتيجية مستقل عن market_structure
-    العام، حتى لا يؤدي تصنيف MIXED إلى منعها تلقائياً.
+    يرفض الدخول إذا أصبح سعر التأكيد بعيداً جداً عن EMA20،
+    لتقليل مطاردة الحركة بعد امتدادها.
     """
 
     def reject(reason):
@@ -691,8 +761,6 @@ def strategy_trend_pullback(
     ):
         return reject("EMA, RSI or slope unavailable")
 
-    # تحديد الاتجاه محلياً لهذه الاستراتيجية.
-    # لا نشترط أن تكون market_structure مثالية.
     bullish_bias = (
         ema20 > ema50
         and slope20 > 0
@@ -722,8 +790,6 @@ def strategy_trend_pullback(
     if not metrics:
         return reject("invalid confirmation candle")
 
-    # شروط شمعة التأكيد أصبحت مرنة قليلاً،
-    # مع الاحتفاظ بجسم واضح وحجم حركة معقول.
     if metrics["body_ratio"] < 0.35:
         return reject("confirmation body too small")
 
@@ -733,7 +799,14 @@ def strategy_trend_pullback(
     if metrics["range"] > average_atr * 2.20:
         return reject("confirmation candle too large")
 
-    # فحص الاندفاع السابق.
+    # منع الدخول المتأخر بعد ابتعاد السعر عن EMA20.
+    ema_extension = abs(current["close"] - ema20) / average_atr
+
+    if ema_extension > PULLBACK_MAX_EMA_EXTENSION_ATR:
+        return reject(
+            f"late entry: EMA20 extension={ema_extension:.2f} ATR"
+        )
+
     if not check_trend_impulse(
         candles,
         direction,
@@ -746,7 +819,6 @@ def strategy_trend_pullback(
     pullback_candles = candles[-5:-1]
 
     if direction == "UP":
-        # يجب أن يحدث تراجع باتجاه EMA20 أو EMA50.
         pullback = any(
             candle["low"] <= ema20 + average_atr * 0.35
             and candle["low"] >= ema50 - average_atr * 0.80
@@ -764,8 +836,6 @@ def strategy_trend_pullback(
         if invalidated_pullback:
             return reject("bullish pullback invalidated below EMA50")
 
-        # التأكيد الأساسي: شمعة صاعدة تغلق فوق EMA20.
-        # يسمح باستئناف الزخم دون اشتراط اختراق قمة السابقة دائماً.
         bullish_candle = (
             current["close"] > current["open"]
             and current["close"] > ema20
@@ -797,7 +867,6 @@ def strategy_trend_pullback(
             "Trend Pullback: اتجاه صاعد مع اندفاع سابق وتصحيح نحو EMA واستئناف مؤكد"
         )
 
-    # الاتجاه الهابط.
     pullback = any(
         candle["high"] >= ema20 - average_atr * 0.35
         and candle["high"] <= ema50 + average_atr * 0.80
@@ -1111,7 +1180,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
     support, resistance = find_support_resistance(candles)
 
-    # الاستراتيجيات الأربع مستقلة.
     strategies = [
         strategy_support_rejection(
             candles,
@@ -1157,7 +1225,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         elif direction == "PUT":
             puts.append((reason, direction))
 
-    # لا نرسل اتجاهين متضادين للسوق نفسه.
     if calls and puts:
         logger.info(
             "Signal conflict | symbol=%s | CALL=%s | PUT=%s",
