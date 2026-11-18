@@ -15,22 +15,37 @@ SR_LOOKBACK = 60
 SR_CLUSTER_ATR = 0.35
 SR_MIN_TOUCHES = 2
 SR_MIN_TOUCH_GAP = 3
-
-# Minimum available room before the opposing S/R level.
-# A rejection signal is ignored when the opposite level is too close.
 SR_MIN_OPPOSING_ROOM_ATR = 0.80
 
 # Trend
 TREND_ADX_MIN = 20
 TREND_SLOPE_LOOKBACK = 5
 
-# Trend Pullback impulse settings
+# Trend Pullback
 PULLBACK_IMPULSE_LOOKBACK = 6
 PULLBACK_MIN_IMPULSE_ATR = 0.35
 PULLBACK_MIN_DIRECTIONAL_CANDLES = 2
-
-# Avoid chasing a pullback confirmation too far from EMA20.
 PULLBACK_MAX_EMA_EXTENSION_ATR = 0.90
+
+# New strategies
+LIQUIDITY_LOOKBACK = 20
+LIQUIDITY_SWEEP_ATR = 0.08
+
+MSS_LOOKBACK = 25
+MSS_MIN_BODY_RATIO = 0.40
+
+FVG_MIN_SIZE_ATR = 0.12
+FVG_MAX_AGE = 8
+
+VWAP_LOOKBACK = 30
+VWAP_MIN_DISTANCE_ATR = 0.80
+
+SQUEEZE_LOOKBACK = 20
+SQUEEZE_HISTORY = 60
+SQUEEZE_BREAKOUT_ATR = 0.08
+
+DIVERGENCE_LOOKBACK = 35
+DIVERGENCE_MIN_RSI_GAP = 4
 
 _sent = {}
 
@@ -60,13 +75,25 @@ def valid_candles(candles):
             if h < max(o, c, l) or l > min(o, c, h):
                 continue
 
-            result.append({
+            item = {
                 **candle,
                 "open": o,
                 "high": h,
                 "low": l,
                 "close": c
-            })
+            }
+
+            # Volume is optional. Invalid volume is treated as unavailable.
+            try:
+                volume = float(candle.get("volume"))
+                if isfinite(volume) and volume > 0:
+                    item["volume"] = volume
+                else:
+                    item.pop("volume", None)
+            except (TypeError, ValueError):
+                item.pop("volume", None)
+
+            result.append(item)
 
         except (KeyError, TypeError, ValueError):
             continue
@@ -146,10 +173,6 @@ def atr(candles, period=14):
 
 
 def adx(candles, period=ADX_PERIOD):
-    """
-    Wilder ADX.
-    """
-
     if len(candles) < (period * 2) + 1:
         return None, None, None
 
@@ -307,16 +330,10 @@ def market_structure(candles, lookback=45):
     previous_low = lows[-2][1]
     current_low = lows[-1][1]
 
-    higher_high = current_high > previous_high
-    higher_low = current_low > previous_low
-
-    lower_high = current_high < previous_high
-    lower_low = current_low < previous_low
-
-    if higher_high and higher_low:
+    if current_high > previous_high and current_low > previous_low:
         return "UP"
 
-    if lower_high and lower_low:
+    if current_high < previous_high and current_low < previous_low:
         return "DOWN"
 
     return "MIXED"
@@ -362,12 +379,9 @@ def get_trend(candles):
         and (ema200 is None or ema50 < ema200)
     )
 
-    bullish_position = price > ema20
-    bearish_position = price < ema20
-
     if (
         bullish_stack
-        and bullish_position
+        and price > ema20
         and slope20 > 0
         and structure == "UP"
     ):
@@ -375,7 +389,7 @@ def get_trend(candles):
 
     if (
         bearish_stack
-        and bearish_position
+        and price < ema20
         and slope20 < 0
         and structure == "DOWN"
     ):
@@ -405,7 +419,6 @@ def find_clustered_level(pivots, price, average_atr, direction):
         ]
 
         cluster.sort(key=lambda item: item[0])
-
         distinct = []
 
         for item in cluster:
@@ -456,7 +469,6 @@ def find_support_resistance(candles, lookback=SR_LOOKBACK):
         return None, None
 
     price = candles[-1]["close"]
-
     highs, lows = find_pivots(history)
 
     support_data = find_clustered_level(
@@ -479,15 +491,6 @@ def has_opposing_level_room(
     average_atr,
     direction
 ):
-    """
-    يتأكد من وجود مساحة كافية بين سعر الدخول والمنطقة المقابلة.
-
-    CALL: المسافة من السعر إلى المقاومة.
-    PUT: المسافة من السعر إلى الدعم.
-
-    إذا لم تتوفر منطقة مقابلة، لا يرفض الإشارة لهذا السبب وحده.
-    """
-
     if opposing_level is None:
         return True
 
@@ -501,10 +504,12 @@ def has_opposing_level_room(
     else:
         return False
 
-    required_room = average_atr * SR_MIN_OPPOSING_ROOM_ATR
+    return room >= average_atr * SR_MIN_OPPOSING_ROOM_ATR
 
-    return room >= required_room
 
+# ============================================================
+# OLD STRATEGIES - preserved
+# ============================================================
 
 def strategy_support_rejection(
     candles,
@@ -512,15 +517,11 @@ def strategy_support_rejection(
     resistance,
     average_atr
 ):
-    if support is None or average_atr is None:
-        return None
-
-    if len(candles) < 3:
+    if support is None or average_atr is None or len(candles) < 3:
         return None
 
     current = candles[-1]
     previous = candles[-2]
-
     metrics = candle_metrics(current)
 
     if not metrics:
@@ -547,37 +548,19 @@ def strategy_support_rejection(
         and metrics["body_ratio"] >= 0.18
     )
 
-    if false_breakout:
-        if not has_opposing_level_room(
-            current["close"],
-            resistance,
-            average_atr,
-            "CALL"
-        ):
-            return None
-
-        return (
-            "CALL",
-            "Support Rejection: كسر كاذب للدعم وعودة مؤكدة فوق المنطقة"
-        )
-
-    touched_level = (
+    if false_breakout or (
         current["low"] <= support + tolerance
         and current["low"] >= support - average_atr * 0.35
-    )
-
-    if touched_level and bullish_rejection:
+        and bullish_rejection
+    ):
         if not has_opposing_level_room(
-            current["close"],
-            resistance,
-            average_atr,
-            "CALL"
+            current["close"], resistance, average_atr, "CALL"
         ):
             return None
 
         return (
             "CALL",
-            "Support Rejection: اختبار منطقة دعم متعددة اللمسات ورفض سعري"
+            "Support Rejection: اختبار الدعم ورفض سعري صاعد"
         )
 
     return None
@@ -589,15 +572,11 @@ def strategy_resistance_rejection(
     resistance,
     average_atr
 ):
-    if resistance is None or average_atr is None:
-        return None
-
-    if len(candles) < 3:
+    if resistance is None or average_atr is None or len(candles) < 3:
         return None
 
     current = candles[-1]
     previous = candles[-2]
-
     metrics = candle_metrics(current)
 
     if not metrics:
@@ -624,54 +603,30 @@ def strategy_resistance_rejection(
         and metrics["body_ratio"] >= 0.18
     )
 
-    if false_breakout:
-        if not has_opposing_level_room(
-            current["close"],
-            support,
-            average_atr,
-            "PUT"
-        ):
-            return None
-
-        return (
-            "PUT",
-            "Resistance Rejection: كسر كاذب للمقاومة وعودة مؤكدة أسفل المنطقة"
-        )
-
-    touched_level = (
+    if false_breakout or (
         current["high"] >= resistance - tolerance
         and current["high"] <= resistance + average_atr * 0.35
-    )
-
-    if touched_level and bearish_rejection:
+        and bearish_rejection
+    ):
         if not has_opposing_level_room(
-            current["close"],
-            support,
-            average_atr,
-            "PUT"
+            current["close"], support, average_atr, "PUT"
         ):
             return None
 
         return (
             "PUT",
-            "Resistance Rejection: اختبار منطقة مقاومة متعددة اللمسات ورفض سعري"
+            "Resistance Rejection: اختبار المقاومة ورفض سعري هابط"
         )
 
     return None
 
 
 def check_trend_impulse(candles, direction, average_atr):
-    """
-    يفحص وجود اندفاع سابق يدعم الاتجاه.
-    يستخدم ست شمعات مكتملة قبل شموع التصحيح والتأكيد.
-    """
-
     if average_atr is None or average_atr <= 0:
         return False
 
     start = -(PULLBACK_IMPULSE_LOOKBACK + 5)
     end = -5
-
     impulse_candles = candles[start:end]
 
     if len(impulse_candles) != PULLBACK_IMPULSE_LOOKBACK:
@@ -691,13 +646,11 @@ def check_trend_impulse(candles, direction, average_atr):
 
     if direction == "UP":
         directional_count = sum(
-            1 for candle in impulse_candles
-            if candle["close"] > candle["open"]
+            1 for c in impulse_candles if c["close"] > c["open"]
         )
     else:
         directional_count = sum(
-            1 for candle in impulse_candles
-            if candle["close"] < candle["open"]
+            1 for c in impulse_candles if c["close"] < c["open"]
         )
 
     return directional_count >= PULLBACK_MIN_DIRECTIONAL_CANDLES
@@ -711,40 +664,16 @@ def strategy_trend_pullback(
     plus_di=None,
     minus_di=None
 ):
-    """
-    Trend Pullback:
-    اتجاه قوي + اندفاع سابق + تصحيح منظم + استئناف مؤكد.
-
-    يرفض الدخول إذا أصبح سعر التأكيد بعيداً جداً عن EMA20،
-    لتقليل مطاردة الحركة بعد امتدادها.
-    """
-
-    def reject(reason):
-        logger.debug(
-            "Trend Pullback rejected: %s",
-            reason
-        )
+    if len(candles) < 60 or average_atr is None or average_atr <= 0:
         return None
 
-    if len(candles) < 60:
-        return reject("not enough candles")
-
-    if average_atr is None or average_atr <= 0:
-        return reject("invalid ATR")
-
-    if current_adx is None:
-        return reject("ADX unavailable")
-
-    if current_adx < TREND_ADX_MIN:
-        return reject(
-            f"ADX too weak: {current_adx:.2f}"
-        )
+    if current_adx is None or current_adx < TREND_ADX_MIN:
+        return None
 
     if plus_di is None or minus_di is None:
-        return reject("DI unavailable")
+        return None
 
     closes = [c["close"] for c in candles]
-
     current = candles[-1]
     previous = candles[-2]
 
@@ -753,13 +682,8 @@ def strategy_trend_pullback(
     current_rsi = rsi(closes)
     slope20 = ema_slope(closes, 20)
 
-    if (
-        ema20 is None
-        or ema50 is None
-        or current_rsi is None
-        or slope20 is None
-    ):
-        return reject("EMA, RSI or slope unavailable")
+    if None in (ema20, ema50, current_rsi, slope20):
+        return None
 
     bullish_bias = (
         ema20 > ema50
@@ -775,145 +699,91 @@ def strategy_trend_pullback(
         and current["close"] < ema20 + average_atr * 0.15
     )
 
-    if bullish_bias and bearish_bias:
-        return reject("conflicting directional bias")
-
-    if not bullish_bias and not bearish_bias:
-        return reject(
-            "no aligned EMA, slope and DI direction"
-        )
+    if bullish_bias == bearish_bias:
+        return None
 
     direction = "UP" if bullish_bias else "DOWN"
-
     metrics = candle_metrics(current)
 
     if not metrics:
-        return reject("invalid confirmation candle")
+        return None
 
-    if metrics["body_ratio"] < 0.35:
-        return reject("confirmation body too small")
-
-    if metrics["range"] < average_atr * 0.40:
-        return reject("confirmation range too small")
-
-    if metrics["range"] > average_atr * 2.20:
-        return reject("confirmation candle too large")
-
-    # منع الدخول المتأخر بعد ابتعاد السعر عن EMA20.
-    ema_extension = abs(current["close"] - ema20) / average_atr
-
-    if ema_extension > PULLBACK_MAX_EMA_EXTENSION_ATR:
-        return reject(
-            f"late entry: EMA20 extension={ema_extension:.2f} ATR"
-        )
-
-    if not check_trend_impulse(
-        candles,
-        direction,
-        average_atr
+    if (
+        metrics["body_ratio"] < 0.35
+        or metrics["range"] < average_atr * 0.40
+        or metrics["range"] > average_atr * 2.20
     ):
-        return reject(
-            f"{direction} impulse conditions not met"
-        )
+        return None
+
+    extension = abs(current["close"] - ema20) / average_atr
+
+    if extension > PULLBACK_MAX_EMA_EXTENSION_ATR:
+        return None
+
+    if not check_trend_impulse(candles, direction, average_atr):
+        return None
 
     pullback_candles = candles[-5:-1]
 
     if direction == "UP":
         pullback = any(
-            candle["low"] <= ema20 + average_atr * 0.35
-            and candle["low"] >= ema50 - average_atr * 0.80
-            for candle in pullback_candles
+            c["low"] <= ema20 + average_atr * 0.35
+            and c["low"] >= ema50 - average_atr * 0.80
+            for c in pullback_candles
         )
 
-        if not pullback:
-            return reject("no valid bullish pullback to EMA zone")
-
-        invalidated_pullback = any(
-            candle["close"] < ema50 - average_atr * 0.50
-            for candle in pullback_candles
-        )
-
-        if invalidated_pullback:
-            return reject("bullish pullback invalidated below EMA50")
-
-        bullish_candle = (
-            current["close"] > current["open"]
-            and current["close"] > ema20
-            and metrics["close_position"] >= 0.62
-        )
-
-        bullish_breakout = (
-            current["close"] > previous["high"]
-        )
-
-        bullish_momentum = (
-            current["close"] > previous["close"]
-            and current["close"] > previous["close"] + average_atr * 0.03
+        invalidated = any(
+            c["close"] < ema50 - average_atr * 0.50
+            for c in pullback_candles
         )
 
         recovery = (
-            bullish_candle
-            and (bullish_breakout or bullish_momentum)
+            current["close"] > current["open"]
+            and current["close"] > ema20
+            and metrics["close_position"] >= 0.62
+            and (
+                current["close"] > previous["high"]
+                or current["close"] > previous["close"] + average_atr * 0.03
+            )
             and 48 <= current_rsi <= 75
         )
 
-        if not recovery:
-            return reject(
-                "bullish resumption confirmation not satisfied"
+        if pullback and not invalidated and recovery:
+            return (
+                "CALL",
+                "Trend Pullback: اتجاه صاعد وتصحيح واستئناف مؤكد"
             )
 
-        return (
-            "CALL",
-            "Trend Pullback: اتجاه صاعد مع اندفاع سابق وتصحيح نحو EMA واستئناف مؤكد"
+    else:
+        pullback = any(
+            c["high"] >= ema20 - average_atr * 0.35
+            and c["high"] <= ema50 + average_atr * 0.80
+            for c in pullback_candles
         )
 
-    pullback = any(
-        candle["high"] >= ema20 - average_atr * 0.35
-        and candle["high"] <= ema50 + average_atr * 0.80
-        for candle in pullback_candles
-    )
-
-    if not pullback:
-        return reject("no valid bearish pullback to EMA zone")
-
-    invalidated_pullback = any(
-        candle["close"] > ema50 + average_atr * 0.50
-        for candle in pullback_candles
-    )
-
-    if invalidated_pullback:
-        return reject("bearish pullback invalidated above EMA50")
-
-    bearish_candle = (
-        current["close"] < current["open"]
-        and current["close"] < ema20
-        and metrics["close_position"] <= 0.38
-    )
-
-    bearish_breakout = (
-        current["close"] < previous["low"]
-    )
-
-    bearish_momentum = (
-        current["close"] < previous["close"]
-        and current["close"] < previous["close"] - average_atr * 0.03
-    )
-
-    recovery = (
-        bearish_candle
-        and (bearish_breakout or bearish_momentum)
-        and 25 <= current_rsi <= 52
-    )
-
-    if not recovery:
-        return reject(
-            "bearish resumption confirmation not satisfied"
+        invalidated = any(
+            c["close"] > ema50 + average_atr * 0.50
+            for c in pullback_candles
         )
 
-    return (
-        "PUT",
-        "Trend Pullback: اتجاه هابط مع اندفاع سابق وتصحيح نحو EMA واستئناف مؤكد"
-    )
+        recovery = (
+            current["close"] < current["open"]
+            and current["close"] < ema20
+            and metrics["close_position"] <= 0.38
+            and (
+                current["close"] < previous["low"]
+                or current["close"] < previous["close"] - average_atr * 0.03
+            )
+            and 25 <= current_rsi <= 52
+        )
+
+        if pullback and not invalidated and recovery:
+            return (
+                "PUT",
+                "Trend Pullback: اتجاه هابط وتصحيح واستئناف مؤكد"
+            )
+
+    return None
 
 
 def strategy_breakout_retest(candles, average_atr):
@@ -922,7 +792,6 @@ def strategy_breakout_retest(candles, average_atr):
 
     previous = candles[-2]
     current = candles[-1]
-
     reference = candles[-32:-2]
 
     if len(reference) < 20:
@@ -940,7 +809,7 @@ def strategy_breakout_retest(candles, average_atr):
     if not previous_metrics or not current_metrics:
         return None
 
-    bullish_retest = (
+    bullish = (
         previous["close"] > resistance + breakout_buffer
         and previous["close"] > previous["open"]
         and previous_metrics["body_ratio"] >= 0.45
@@ -952,7 +821,7 @@ def strategy_breakout_retest(candles, average_atr):
         and current_metrics["body_ratio"] >= 0.25
     )
 
-    bearish_retest = (
+    bearish = (
         previous["close"] < support - breakout_buffer
         and previous["close"] < previous["open"]
         and previous_metrics["body_ratio"] >= 0.45
@@ -964,20 +833,478 @@ def strategy_breakout_retest(candles, average_atr):
         and current_metrics["body_ratio"] >= 0.25
     )
 
-    if bullish_retest:
+    if bullish:
+        return "CALL", "Breakout Retest: اختراق وإعادة اختبار ناجحة"
+
+    if bearish:
+        return "PUT", "Breakout Retest: كسر وإعادة اختبار ناجحة"
+
+    return None
+
+
+# ============================================================
+# NEW STRATEGY 1: Liquidity Sweep
+# ============================================================
+
+def strategy_liquidity_sweep(candles, average_atr):
+    if len(candles) < LIQUIDITY_LOOKBACK + 3 or not average_atr:
+        return None
+
+    current = candles[-1]
+    previous_levels = candles[-(LIQUIDITY_LOOKBACK + 1):-1]
+
+    recent_high = max(c["high"] for c in previous_levels)
+    recent_low = min(c["low"] for c in previous_levels)
+
+    metrics = candle_metrics(current)
+
+    if not metrics:
+        return None
+
+    buffer = average_atr * LIQUIDITY_SWEEP_ATR
+
+    bullish_sweep = (
+        current["low"] < recent_low - buffer
+        and current["close"] > recent_low
+        and current["close"] > current["open"]
+        and metrics["lower_wick"] >= metrics["body"] * 0.8
+        and metrics["close_position"] >= 0.62
+    )
+
+    bearish_sweep = (
+        current["high"] > recent_high + buffer
+        and current["close"] < recent_high
+        and current["close"] < current["open"]
+        and metrics["upper_wick"] >= metrics["body"] * 0.8
+        and metrics["close_position"] <= 0.38
+    )
+
+    if bullish_sweep:
         return (
             "CALL",
-            "Breakout Retest: اختراق قوي وإعادة اختبار ناجحة للمقاومة"
+            "Liquidity Sweep: سحب سيولة أسفل القاع والعودة فوقه"
         )
 
-    if bearish_retest:
+    if bearish_sweep:
         return (
             "PUT",
-            "Breakout Retest: كسر قوي وإعادة اختبار ناجحة للدعم"
+            "Liquidity Sweep: سحب سيولة أعلى القمة والعودة أسفلها"
         )
 
     return None
 
+
+# ============================================================
+# NEW STRATEGY 2: Market Structure Shift
+# ============================================================
+
+def strategy_market_structure_shift(candles, average_atr):
+    if len(candles) < MSS_LOOKBACK + 5 or not average_atr:
+        return None
+
+    current = candles[-1]
+    history = candles[-(MSS_LOOKBACK + 1):-1]
+
+    metrics = candle_metrics(current)
+
+    if not metrics or metrics["body_ratio"] < MSS_MIN_BODY_RATIO:
+        return None
+
+    pivot_highs, pivot_lows = find_pivots(history)
+
+    if not pivot_highs or not pivot_lows:
+        return None
+
+    last_swing_high = pivot_highs[-1][1]
+    last_swing_low = pivot_lows[-1][1]
+
+    buffer = average_atr * 0.05
+
+    bullish_shift = (
+        current["close"] > last_swing_high + buffer
+        and current["close"] > current["open"]
+        and metrics["close_position"] >= 0.68
+    )
+
+    bearish_shift = (
+        current["close"] < last_swing_low - buffer
+        and current["close"] < current["open"]
+        and metrics["close_position"] <= 0.32
+    )
+
+    if bullish_shift:
+        return (
+            "CALL",
+            "Market Structure Shift: كسر هيكل هابط باتجاه صاعد"
+        )
+
+    if bearish_shift:
+        return (
+            "PUT",
+            "Market Structure Shift: كسر هيكل صاعد باتجاه هابط"
+        )
+
+    return None
+
+
+# ============================================================
+# NEW STRATEGY 3: Fair Value Gap Retest
+# ============================================================
+
+def strategy_fair_value_gap(candles, average_atr):
+    if len(candles) < FVG_MAX_AGE + 5 or not average_atr:
+        return None
+
+    current = candles[-1]
+    metrics = candle_metrics(current)
+
+    if not metrics:
+        return None
+
+    # Search recent completed three-candle gaps.
+    # The middle candle must show meaningful displacement.
+    for age in range(1, FVG_MAX_AGE + 1):
+        third_index = len(candles) - age - 1
+
+        if third_index < 2:
+            continue
+
+        first = candles[third_index - 2]
+        middle = candles[third_index - 1]
+        third = candles[third_index]
+
+        middle_metrics = candle_metrics(middle)
+
+        if not middle_metrics:
+            continue
+
+        if middle_metrics["body_ratio"] < 0.50:
+            continue
+
+        # Bullish FVG: first candle high below third candle low.
+        bullish_gap = third["low"] - first["high"]
+
+        if (
+            bullish_gap >= average_atr * FVG_MIN_SIZE_ATR
+            and middle["close"] > middle["open"]
+        ):
+            gap_low = first["high"]
+            gap_high = third["low"]
+
+            touched = (
+                current["low"] <= gap_high
+                and current["high"] >= gap_low
+            )
+
+            bullish_reaction = (
+                current["close"] > current["open"]
+                and current["close"] > gap_low
+                and metrics["close_position"] >= 0.58
+            )
+
+            if touched and bullish_reaction:
+                return (
+                    "CALL",
+                    "Fair Value Gap: إعادة اختبار فجوة صاعدة وارتداد"
+                )
+
+        # Bearish FVG: first candle low above third candle high.
+        bearish_gap = first["low"] - third["high"]
+
+        if (
+            bearish_gap >= average_atr * FVG_MIN_SIZE_ATR
+            and middle["close"] < middle["open"]
+        ):
+            gap_low = third["high"]
+            gap_high = first["low"]
+
+            touched = (
+                current["high"] >= gap_low
+                and current["low"] <= gap_high
+            )
+
+            bearish_reaction = (
+                current["close"] < current["open"]
+                and current["close"] < gap_high
+                and metrics["close_position"] <= 0.42
+            )
+
+            if touched and bearish_reaction:
+                return (
+                    "PUT",
+                    "Fair Value Gap: إعادة اختبار فجوة هابطة ورفض"
+                )
+
+    return None
+
+
+# ============================================================
+# NEW STRATEGY 4: VWAP Mean Reversion
+# Requires actual positive volume in candles.
+# No synthetic volume is generated.
+# ============================================================
+
+def strategy_vwap_mean_reversion(candles, average_atr):
+    if len(candles) < VWAP_LOOKBACK + 2 or not average_atr:
+        return None
+
+    window = candles[-VWAP_LOOKBACK:]
+
+    if any(
+        "volume" not in candle
+        or candle["volume"] <= 0
+        for candle in window
+    ):
+        return None
+
+    total_volume = sum(c["volume"] for c in window)
+
+    if total_volume <= 0:
+        return None
+
+    weighted_sum = sum(
+        (
+            (c["high"] + c["low"] + c["close"]) / 3
+        ) * c["volume"]
+        for c in window
+    )
+
+    vwap_value = weighted_sum / total_volume
+    current = candles[-1]
+    previous = candles[-2]
+
+    metrics = candle_metrics(current)
+
+    if not metrics:
+        return None
+
+    distance = current["close"] - vwap_value
+
+    bullish_reversion = (
+        previous["close"] < vwap_value - average_atr * VWAP_MIN_DISTANCE_ATR
+        and current["close"] > current["open"]
+        and current["close"] > previous["close"]
+        and current["close"] > vwap_value - average_atr * 0.45
+        and metrics["close_position"] >= 0.60
+    )
+
+    bearish_reversion = (
+        previous["close"] > vwap_value + average_atr * VWAP_MIN_DISTANCE_ATR
+        and current["close"] < current["open"]
+        and current["close"] < previous["close"]
+        and current["close"] < vwap_value + average_atr * 0.45
+        and metrics["close_position"] <= 0.40
+    )
+
+    if bullish_reversion:
+        return (
+            "CALL",
+            "VWAP Mean Reversion: عودة صاعدة باتجاه VWAP"
+        )
+
+    if bearish_reversion:
+        return (
+            "PUT",
+            "VWAP Mean Reversion: عودة هابطة باتجاه VWAP"
+        )
+
+    return None
+
+
+# ============================================================
+# NEW STRATEGY 5: Volatility Squeeze Breakout
+# ============================================================
+
+def bollinger_width(candles, period=20):
+    if len(candles) < period:
+        return None
+
+    closes = [c["close"] for c in candles[-period:]]
+    middle = sum(closes) / period
+
+    if middle <= 0:
+        return None
+
+    variance = sum(
+        (value - middle) ** 2 for value in closes
+    ) / period
+
+    deviation = variance ** 0.5
+
+    upper = middle + 2 * deviation
+    lower = middle - 2 * deviation
+
+    return (upper - lower) / middle
+
+
+def strategy_volatility_squeeze_breakout(candles, average_atr):
+    required = SQUEEZE_HISTORY + SQUEEZE_LOOKBACK + 2
+
+    if len(candles) < required or not average_atr:
+        return None
+
+    widths = []
+
+    # Historical widths exclude the current candle.
+    for end in range(
+        len(candles) - SQUEEZE_HISTORY - 1,
+        len(candles) - 1
+    ):
+        width = bollinger_width(
+            candles[:end + 1],
+            SQUEEZE_LOOKBACK
+        )
+
+        if width is not None:
+            widths.append(width)
+
+    if len(widths) < 30:
+        return None
+
+    current_width = bollinger_width(
+        candles[:-1],
+        SQUEEZE_LOOKBACK
+    )
+
+    if current_width is None:
+        return None
+
+    sorted_widths = sorted(widths)
+    lower_quartile = sorted_widths[
+        max(0, int(len(sorted_widths) * 0.25) - 1)
+    ]
+
+    if current_width > lower_quartile:
+        return None
+
+    current = candles[-1]
+    previous_range = candles[-(SQUEEZE_LOOKBACK + 1):-1]
+
+    range_high = max(c["high"] for c in previous_range)
+    range_low = min(c["low"] for c in previous_range)
+
+    metrics = candle_metrics(current)
+
+    if not metrics:
+        return None
+
+    bullish_breakout = (
+        current["close"] > range_high + average_atr * SQUEEZE_BREAKOUT_ATR
+        and current["close"] > current["open"]
+        and metrics["body_ratio"] >= 0.50
+        and metrics["close_position"] >= 0.70
+        and metrics["range"] <= average_atr * 2.5
+    )
+
+    bearish_breakout = (
+        current["close"] < range_low - average_atr * SQUEEZE_BREAKOUT_ATR
+        and current["close"] < current["open"]
+        and metrics["body_ratio"] >= 0.50
+        and metrics["close_position"] <= 0.30
+        and metrics["range"] <= average_atr * 2.5
+    )
+
+    if bullish_breakout:
+        return (
+            "Volatility Squeeze Breakout",
+            "CALL",
+        )
+
+    if bearish_breakout:
+        return (
+            "Volatility Squeeze Breakout",
+            "PUT",
+        )
+
+    return None
+
+
+# ============================================================
+# NEW STRATEGY 6: Momentum Divergence
+# ============================================================
+
+def strategy_momentum_divergence(candles):
+    if len(candles) < DIVERGENCE_LOOKBACK + 20:
+        return None
+
+    history = candles[-DIVERGENCE_LOOKBACK:]
+    closes = [c["close"] for c in history]
+    rsi_values = []
+
+    for i in range(len(history)):
+        value = rsi(closes[:i + 1])
+
+        if value is None:
+            rsi_values.append(None)
+        else:
+            rsi_values.append(value)
+
+    price_highs, price_lows = find_pivots(history)
+
+    valid_highs = [
+        (i, value)
+        for i, value in price_highs
+        if rsi_values[i] is not None
+    ]
+
+    valid_lows = [
+        (i, value)
+        for i, value in price_lows
+        if rsi_values[i] is not None
+    ]
+
+    current = history[-1]
+    metrics = candle_metrics(current)
+
+    if not metrics:
+        return None
+
+    if len(valid_lows) >= 2:
+        (old_i, old_low), (new_i, new_low) = valid_lows[-2:]
+
+        old_rsi = rsi_values[old_i]
+        new_rsi = rsi_values[new_i]
+
+        bullish_divergence = (
+            new_low < old_low
+            and new_rsi > old_rsi + DIVERGENCE_MIN_RSI_GAP
+            and new_i >= len(history) - 5
+            and current["close"] > current["open"]
+            and metrics["close_position"] >= 0.58
+        )
+
+        if bullish_divergence:
+            return (
+                "CALL",
+                "Momentum Divergence: قاع سعري أدنى مع RSI أعلى"
+            )
+
+    if len(valid_highs) >= 2:
+        (old_i, old_high), (new_i, new_high) = valid_highs[-2:]
+
+        old_rsi = rsi_values[old_i]
+        new_rsi = rsi_values[new_i]
+
+        bearish_divergence = (
+            new_high > old_high
+            and new_rsi < old_rsi - DIVERGENCE_MIN_RSI_GAP
+            and new_i >= len(history) - 5
+            and current["close"] < current["open"]
+            and metrics["close_position"] <= 0.42
+        )
+
+        if bearish_divergence:
+            return (
+                "PUT",
+                "Momentum Divergence: قمة سعرية أعلى مع RSI أدنى"
+            )
+
+    return None
+
+
+# ============================================================
+# Signal score
+# ============================================================
 
 def calculate_signal_score(
     selected,
@@ -993,7 +1320,6 @@ def calculate_signal_score(
     average_atr
 ):
     score = 45.0
-
     strategy_count = len(selected)
 
     if strategy_count >= 2:
@@ -1094,9 +1420,14 @@ def select_trade_duration(signal):
         or (direction == "PUT" and trend == "DOWN")
     )
 
-    continuation_signal = (
-        "Trend Pullback" in strategies
-        or "Breakout Retest" in strategies
+    continuation_signal = any(
+        name in strategies
+        for name in (
+            "Trend Pullback",
+            "Breakout Retest",
+            "Market Structure Shift",
+            "Volatility Squeeze Breakout"
+        )
     )
 
     if (
@@ -1116,19 +1447,20 @@ def select_trade_duration(signal):
             "اتجاه متوافق وزخم مناسب واستمرار محتمل للحركة"
         )
 
-    if (
-        "Support Rejection" in strategies
-        or "Resistance Rejection" in strategies
+    if any(
+        name in strategies
+        for name in (
+            "Support Rejection",
+            "Resistance Rejection",
+            "Liquidity Sweep",
+            "Fair Value Gap",
+            "VWAP Mean Reversion",
+            "Momentum Divergence"
+        )
     ):
         return (
             60,
-            "ارتداد من دعم أو مقاومة؛ اختيار مدة أقصر للاختبار"
-        )
-
-    if not trend_aligned:
-        return (
-            60,
-            "الاتجاه غير متوافق بوضوح؛ اختيار مدة أقصر للاختبار"
+            "إشارة ارتداد أو انعكاس؛ اختيار مدة أقصر للاختبار"
         )
 
     return (
@@ -1137,9 +1469,13 @@ def select_trade_duration(signal):
     )
 
 
+# ============================================================
+# Main analysis
+# ============================================================
+
 def analyze_signal(candles_1m, candles_5m=None, symbol=None):
-    # التحليل بالكامل على فريم الدقيقة.
-    # لا نستخدم بيانات 5m.
+    # All strategies use completed 1-minute candles supplied
+    # by scanner.py. No 5m or future candle data is used.
 
     candles = valid_candles(candles_1m)
 
@@ -1147,7 +1483,6 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         return None
 
     closes = [c["close"] for c in candles]
-
     current = candles[-1]
     price = current["close"]
 
@@ -1174,27 +1509,18 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
 
     range_ratio = (
         current_metrics["range"] / average_atr
-        if average_atr > 0
-        else None
     )
 
     support, resistance = find_support_resistance(candles)
 
-    strategies = [
+    # Existing four strategies
+    strategy_results = [
         strategy_support_rejection(
-            candles,
-            support,
-            resistance,
-            average_atr
+            candles, support, resistance, average_atr
         ),
-
         strategy_resistance_rejection(
-            candles,
-            support,
-            resistance,
-            average_atr
+            candles, support, resistance, average_atr
         ),
-
         strategy_trend_pullback(
             candles,
             trend,
@@ -1203,27 +1529,38 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
             plus_di,
             minus_di
         ),
-
-        strategy_breakout_retest(
-            candles,
-            average_atr
-        )
+        strategy_breakout_retest(candles, average_atr)
     ]
+
+    # Six additional strategies
+    strategy_results.extend([
+        strategy_liquidity_sweep(candles, average_atr),
+        strategy_market_structure_shift(candles, average_atr),
+        strategy_fair_value_gap(candles, average_atr),
+        strategy_vwap_mean_reversion(candles, average_atr),
+        strategy_volatility_squeeze_breakout(candles, average_atr),
+        strategy_momentum_divergence(candles)
+    ])
 
     calls = []
     puts = []
 
-    for result in strategies:
+    for result in strategy_results:
         if result is None:
             continue
 
-        direction, reason = result
+        # Accept both (direction, reason) and (name, direction, reason)
+        if len(result) == 2:
+            direction, reason = result
+            strategy_name = reason.split(":")[0]
+        else:
+            strategy_name, direction, reason = result
 
         if direction == "CALL":
-            calls.append((reason, direction))
+            calls.append((strategy_name, reason, direction))
 
         elif direction == "PUT":
-            puts.append((reason, direction))
+            puts.append((strategy_name, reason, direction))
 
     if calls and puts:
         logger.info(
@@ -1239,16 +1576,14 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     if not selected:
         return None
 
-    direction = selected[0][1]
+    direction = selected[0][2]
 
     matching_strategies = [
-        item[0].split(":")[0]
-        for item in selected
+        item[0] for item in selected
     ]
 
     strategy_reasons = [
-        item[0]
-        for item in selected
+        item[1] for item in selected
     ]
 
     score = calculate_signal_score(
@@ -1297,7 +1632,12 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
         "ema20": ema20,
         "ema50": ema50,
         "ema200": ema200,
-        "analysis_timeframe": "1m"
+        "analysis_timeframe": "1m",
+        "strategy_count": 10,
+        "volume_available": all(
+            "volume" in c
+            for c in candles[-VWAP_LOOKBACK:]
+        )
     }
 
     selected_duration, duration_reason = (
@@ -1308,6 +1648,16 @@ def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     signal["duration_seconds"] = selected_duration
     signal["expiry_minutes"] = selected_duration // 60
     signal["duration_reason"] = duration_reason
+
+    logger.info(
+        "SIGNAL ANALYSIS | symbol=%s | direction=%s | "
+        "strategies=%s | score=%.1f | duration=%s",
+        symbol,
+        direction,
+        matching_strategies,
+        score,
+        selected_duration
+    )
 
     return signal
 
