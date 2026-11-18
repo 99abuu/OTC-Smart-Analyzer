@@ -51,6 +51,10 @@ MAX_CANDLES = 400
 
 OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
+# أقصى تأخير مسموح لأول Tick عند بداية الدقيقة.
+# إذا وصل أول Tick بعد ذلك، لا نعتمد الشمعة في التاريخ.
+MAX_CANDLE_START_DELAY = 2
+
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
 
 _candidate_rotation_offset = 0
@@ -1074,6 +1078,11 @@ async def scanner_loop(
         OTC_TICK_TIME_OFFSET_SECONDS
     )
 
+    logger.info(
+        "Maximum live candle start delay: %s seconds",
+        MAX_CANDLE_START_DELAY
+    )
+
     logger.info("Display timezone: Europe/Nicosia")
 
     if selection_queue is None:
@@ -1213,6 +1222,9 @@ async def scanner_loop(
 
     current_1m = {}
 
+    # True فقط إذا بدأ استقبال الشمعة خلال أول ثانيتين.
+    current_1m_complete = {}
+
     data_ready = {
         symbol: has_recent_contiguous_candles(
             candles_1m[symbol],
@@ -1300,6 +1312,7 @@ async def scanner_loop(
         nonlocal worker
         nonlocal candles_1m
         nonlocal current_1m
+        nonlocal current_1m_complete
         nonlocal data_ready
         nonlocal selection_mode
         nonlocal next_refresh
@@ -1369,6 +1382,7 @@ async def scanner_loop(
         }
 
         current_1m = {}
+        current_1m_complete = {}
 
         tick_queue = queue.Queue()
         stop_event = threading.Event()
@@ -1948,6 +1962,23 @@ async def scanner_loop(
                         "close": price
                     }
 
+                    seconds_into_minute = (
+                        timestamp - minute_bucket
+                    )
+
+                    current_1m_complete[symbol] = (
+                        0 <= seconds_into_minute
+                        <= MAX_CANDLE_START_DELAY
+                    )
+
+                    if not current_1m_complete[symbol]:
+                        logger.warning(
+                            "LIVE CANDLE STARTED LATE: %s | "
+                            "delay=%.2fs | candle will not enter history",
+                            symbol,
+                            seconds_into_minute
+                        )
+
                     continue
 
                 if minute_bucket == candle["bucket"]:
@@ -1964,6 +1995,7 @@ async def scanner_loop(
                     if (
                         gap_seconds == 60
                         and data_ready.get(symbol, False)
+                        and current_1m_complete.get(symbol, False)
                     ):
                         expected_previous_history = (
                             candle["bucket"] - 60
@@ -1997,17 +2029,33 @@ async def scanner_loop(
                             data_ready[symbol] = False
 
                     else:
-                        missing_minutes = (
-                            gap_seconds // 60
-                        ) - 1
+                        if (
+                            gap_seconds == 60
+                            and not current_1m_complete.get(
+                                symbol,
+                                False
+                            )
+                        ):
+                            logger.warning(
+                                "PARTIAL CANDLE DISCARDED: %s | "
+                                "bucket=%s | candle was not observed "
+                                "from the beginning",
+                                symbol,
+                                candle["bucket"]
+                            )
 
-                        logger.warning(
-                            "CANDLE GAP DETECTED: %s | "
-                            "gap=%ss | missing_minutes=%s",
-                            symbol,
-                            gap_seconds,
-                            missing_minutes
-                        )
+                        else:
+                            missing_minutes = (
+                                gap_seconds // 60
+                            ) - 1
+
+                            logger.warning(
+                                "CANDLE GAP DETECTED: %s | "
+                                "gap=%ss | missing_minutes=%s",
+                                symbol,
+                                gap_seconds,
+                                missing_minutes
+                            )
 
                         data_ready[symbol] = False
 
@@ -2042,6 +2090,23 @@ async def scanner_loop(
                         "low": price,
                         "close": price
                     }
+
+                    seconds_into_minute = (
+                        timestamp - minute_bucket
+                    )
+
+                    current_1m_complete[symbol] = (
+                        0 <= seconds_into_minute
+                        <= MAX_CANDLE_START_DELAY
+                    )
+
+                    if not current_1m_complete[symbol]:
+                        logger.warning(
+                            "LIVE CANDLE STARTED LATE: %s | "
+                            "delay=%.2fs | candle will not enter history",
+                            symbol,
+                            seconds_into_minute
+                        )
 
                 else:
                     continue
