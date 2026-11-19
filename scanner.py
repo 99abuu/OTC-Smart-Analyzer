@@ -30,6 +30,7 @@ from trade_history import (
 )
 
 from ai_model import evaluate_signal
+from ai_filter_model import evaluate_signal as evaluate_filter_signal
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,6 @@ MAX_CANDLES = 400
 
 OTC_TICK_TIME_OFFSET_SECONDS = 7200
 
-# أقصى تأخير مسموح لأول Tick عند بداية الدقيقة.
-# إذا وصل أول Tick بعد ذلك، لا نعتمد الشمعة في التاريخ.
 MAX_CANDLE_START_DELAY = 2
 
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
@@ -127,25 +126,22 @@ async def send_status_message(send_status, message):
 
 
 # --------------------------------------------------
-# AI SHADOW EVALUATION
+# AI SHADOW EVALUATION - LOGISTIC REGRESSION
 # --------------------------------------------------
 
 def evaluate_ai_shadow(signal):
     """
-    تقييم الإشارة باستخدام نموذج ML في وضع Shadow فقط.
+    تقييم الإشارة باستخدام النموذج القديم في Shadow فقط.
 
     لا يغير اتجاه الإشارة أو مدتها.
     لا يمنع الإشارة.
-    يحفظ التوقعات مع بيانات الإشارة.
     """
 
     try:
         result = evaluate_signal(signal)
 
         if not isinstance(result, dict):
-            logger.error(
-                "AI returned an invalid result"
-            )
+            logger.error("AI returned an invalid result")
 
             return {
                 "mode": "SHADOW",
@@ -185,6 +181,76 @@ def evaluate_ai_shadow(signal):
 
         return {
             "mode": "SHADOW",
+            "error": "EVALUATION_FAILED",
+            "predictions": {}
+        }
+
+
+# --------------------------------------------------
+# KNN SHADOW EVALUATION - NEW MODEL
+# --------------------------------------------------
+
+def evaluate_knn_shadow(signal):
+    """
+    تقييم مستقل باستخدام KNN في Shadow Mode.
+
+    لا يغير:
+    - اتجاه الإشارة.
+    - الاستراتيجية.
+    - مدة الإشارة.
+    - قرار إرسال الإشارة.
+    - قرار تأكيد الدخول.
+
+    لا يطبق أي عتبة قبول أو رفض.
+    """
+
+    try:
+        result = evaluate_filter_signal(signal)
+
+        if not isinstance(result, dict):
+            logger.error("KNN returned an invalid result")
+
+            return {
+                "mode": "SHADOW",
+                "model": "KNN_Shadow_v1",
+                "error": "INVALID_KNN_RESULT",
+                "predictions": {}
+            }
+
+        predictions = result.get("predictions", {})
+
+        if not isinstance(predictions, dict):
+            predictions = {}
+
+        for horizon in (60, 120):
+            prediction = predictions.get(str(horizon), {})
+
+            if not isinstance(prediction, dict):
+                continue
+
+            logger.info(
+                "KNN SHADOW: symbol=%s | horizon=%ss | "
+                "status=%s | samples=%s | probability=%s | "
+                "validation=%s",
+                signal.get("symbol"),
+                horizon,
+                prediction.get("status"),
+                prediction.get("samples"),
+                prediction.get("win_probability"),
+                prediction.get("validation", {})
+            )
+
+        return result
+
+    except Exception:
+        logger.exception(
+            "KNN shadow evaluation failed for %s",
+            signal.get("symbol")
+        )
+
+        return {
+            "mode": "SHADOW",
+            "model": "KNN_Shadow_v1",
             "error": "EVALUATION_FAILED",
             "predictions": {}
         }
@@ -1058,6 +1124,7 @@ async def scanner_loop(
     logger.info("Manual market selection enabled")
     logger.info("Trade history recording enabled")
     logger.info("AI Shadow Mode enabled")
+    logger.info("KNN Shadow Mode enabled")
 
     logger.info(
         "Dual-duration comparison enabled: %s seconds",
@@ -1225,7 +1292,6 @@ async def scanner_loop(
 
     current_1m = {}
 
-    # True فقط إذا بدأ استقبال الشمعة خلال أول ثانيتين.
     current_1m_complete = {}
 
     data_ready = {
@@ -2392,12 +2458,12 @@ async def scanner_loop(
                 signal["expiry_minutes"] = selected_duration // 60
 
                 # ----------------------------------
-                # AI SHADOW PREDICTION
-                # يتم التقييم قبل إرسال PRE_ALERT
-                # حتى يظهر التقييم مع الإشارة في Telegram
+                # AI SHADOW PREDICTIONS
                 # ----------------------------------
 
                 signal["ai_shadow"] = evaluate_ai_shadow(signal)
+
+                signal["ai_filter_shadow"] = evaluate_knn_shadow(signal)
 
                 earliest_entry = timestamp + PRE_ENTRY_SECONDS
 
@@ -2461,7 +2527,7 @@ async def scanner_loop(
                     continue
 
                 # ----------------------------------
-                # SAVE SIGNAL AND AI PREDICTION
+                # SAVE SIGNAL AND AI PREDICTIONS
                 # ----------------------------------
 
                 history_id = record_signal(signal)
@@ -2481,6 +2547,28 @@ async def scanner_loop(
                                 COMPARISON_DURATIONS
                             )
                         }
+                    )
+
+                    # ----------------------------------
+                    # SAVE KNN SHADOW EVALUATION
+                    # ----------------------------------
+
+                    record_update(
+                        history_id,
+                        "KNN_SHADOW_EVALUATED",
+                        {
+                            "model": "KNN_Shadow_v1",
+                            "evaluation": signal.get(
+                                "ai_filter_shadow",
+                                {}
+                            )
+                        }
+                    )
+
+                    logger.info(
+                        "KNN SHADOW SAVED: %s | history_id=%s",
+                        symbol,
+                        history_id
                     )
 
                 else:
