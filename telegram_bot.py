@@ -86,6 +86,96 @@ def format_signal_details(signal):
     )
 
 
+def format_ai_shadow(signal):
+    ai = signal.get("ai_shadow")
+
+    if not isinstance(ai, dict):
+        return (
+            "🧠 تقييم الذكاء الاصطناعي (Shadow)\n"
+            "لم يتوفر تقييم لهذه الإشارة."
+        )
+
+    predictions = ai.get("predictions", {})
+
+    if not isinstance(predictions, dict):
+        predictions = {}
+
+    status_labels = {
+        "READY": "🟢 النموذج جاهز للتوقع",
+        "INSUFFICIENT_DATA": "🟡 البيانات غير كافية للتدريب",
+        "CLASS_IMBALANCE": "🟡 توازن النتائج غير كافٍ للتدريب"
+    }
+
+    lines = [
+        "🧠 تقييم الذكاء الاصطناعي (Shadow)",
+        f"النموذج: {ai.get('model', 'غير محدد')}"
+    ]
+
+    for horizon in (60, 120):
+        prediction = predictions.get(str(horizon), {})
+
+        if not isinstance(prediction, dict):
+            prediction = {}
+
+        status = str(
+            prediction.get("status", "UNKNOWN")
+        ).upper()
+
+        status_text = status_labels.get(
+            status,
+            f"الحالة: {status}"
+        )
+
+        samples = prediction.get("samples", 0)
+        wins = prediction.get("wins", 0)
+        losses = prediction.get("losses", 0)
+        probability = prediction.get("win_probability")
+
+        lines.extend([
+            "",
+            f"⏱️ أفق {horizon} ثانية:",
+            status_text,
+            f"📊 العينات: {samples}",
+            f"🟢 WIN: {wins} | 🔴 LOSS: {losses}"
+        ])
+
+        if probability is not None:
+            try:
+                probability = float(probability)
+
+                if 0 <= probability <= 100:
+                    lines.append(
+                        f"🎯 احتمال الفوز التقديري للنموذج: "
+                        f"{probability:.2f}%"
+                    )
+                else:
+                    lines.append(
+                        "🎯 الاحتمال: قيمة غير صالحة"
+                    )
+
+            except (TypeError, ValueError):
+                lines.append(
+                    "🎯 الاحتمال: غير متوفر"
+                )
+
+        else:
+            lines.append(
+                "🎯 لا يوجد توقع رقمي بعد"
+            )
+
+    if ai.get("error"):
+        lines.append(
+            f"\n⚠️ ملاحظة: {ai['error']}"
+        )
+
+    lines.extend([
+        "",
+        "ℹ️ هذا تقييم تجريبي للنموذج وليس ضماناً للنتيجة."
+    ])
+
+    return "\n".join(lines)
+
+
 def format_duration(signal):
     duration = signal.get(
         "selected_duration_seconds",
@@ -551,6 +641,7 @@ async def start_scanner_task(app):
     async def notify(signal):
         phase = signal_phase(signal)
         strategies_text = format_signal_details(signal)
+        ai_text = format_ai_shadow(signal)
 
         duration_label, duration_reason = format_duration(
             signal
@@ -576,6 +667,7 @@ async def start_scanner_task(app):
                 f"موعد الدخول المقترح: {entry_time}\n\n"
                 f"⏱️ المدة المختارة تجريبياً: {duration_label}\n"
                 f"🧠 سبب اختيار المدة: {duration_reason}\n\n"
+                f"{ai_text}\n\n"
                 f"{strategies_text}\n\n"
                 "⏳ سيعيد البوت فحص الإشارة قبل الدخول.\n"
                 "إذا تم التأكيد، سيكون الدخول عند بداية الدقيقة المحددة.\n"
@@ -607,6 +699,7 @@ async def start_scanner_task(app):
                 f"🧠 سبب الاختيار: {duration_reason}\n"
                 f"🏁 وقت انتهاء الصفقة: {exit_time}\n"
                 f"💹 السعر المرجعي: {entry_price}\n\n"
+                f"{ai_text}\n\n"
                 f"{strategies_text}\n\n"
                 "📊 سيقارن البوت داخلياً نتيجة 60 و120 ثانية، "
                 "لكن النتيجة الأساسية ستكون للمدة المختارة.\n\n"
