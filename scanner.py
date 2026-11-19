@@ -155,6 +155,9 @@ def evaluate_ai_shadow(signal):
 
         predictions = result.get("predictions", {})
 
+        if not isinstance(predictions, dict):
+            predictions = {}
+
         for horizon in (60, 120):
             prediction = predictions.get(str(horizon), {})
 
@@ -2388,6 +2391,14 @@ async def scanner_loop(
                 signal["duration_reason"] = duration_reason
                 signal["expiry_minutes"] = selected_duration // 60
 
+                # ----------------------------------
+                # AI SHADOW PREDICTION
+                # يتم التقييم قبل إرسال PRE_ALERT
+                # حتى يظهر التقييم مع الإشارة في Telegram
+                # ----------------------------------
+
+                signal["ai_shadow"] = evaluate_ai_shadow(signal)
+
                 earliest_entry = timestamp + PRE_ENTRY_SECONDS
 
                 entry_at = (
@@ -2448,12 +2459,6 @@ async def scanner_loop(
                         symbol
                     )
                     continue
-
-                # ----------------------------------
-                # AI SHADOW PREDICTION
-                # ----------------------------------
-
-                signal["ai_shadow"] = evaluate_ai_shadow(signal)
 
                 # ----------------------------------
                 # SAVE SIGNAL AND AI PREDICTION
