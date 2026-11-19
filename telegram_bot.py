@@ -45,7 +45,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["▶️ START", "⏹ STOP"],
         ["📊 STATUS", "📈 STATS"],
-        ["🔍 ANALYZE", "🌍 MARKETS"]
+        ["🔍 ANALYZE", "🌍 MARKETS"],
+        ["📥 EXPORT HISTORY"]
     ],
     resize_keyboard=True,
     is_persistent=True
@@ -751,7 +752,6 @@ async def start_scanner_task(app):
                 message
             )
 
-            # AI Shadow رسالة مستقلة عن رسالة الإشارة
             ai_text = format_ai_shadow(signal)
 
             await send_to_subscribers(
@@ -1797,6 +1797,12 @@ async def text_buttons(
 
     elif text == "🌍 MARKETS":
         await markets(
+            update,
+            context
+        )
+
+    elif text == "📥 EXPORT HISTORY":
+        await export_history(
             update,
             context
         )
