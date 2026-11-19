@@ -208,6 +208,102 @@ def signal_phase(signal):
     return signal.get("phase") or signal.get("status")
 
 
+def format_strategy_performance(signal):
+    strategies = signal.get("matching_strategies", [])
+
+    if isinstance(strategies, str):
+        strategies = [strategies]
+
+    strategies = list(dict.fromkeys(strategies))
+
+    if not strategies:
+        return "غير محددة"
+
+    try:
+        signals, results, _, _ = read_trade_history()
+    except Exception:
+        logger.exception(
+            "Could not read history for strategy performance"
+        )
+        return "\n".join(
+            f"• {strategy}: غير متوفرة بعد"
+            for strategy in strategies
+        )
+
+    strategy_stats = defaultdict(Counter)
+
+    for signal_id, result in results.items():
+        outcome = str(
+            result.get("outcome", "")
+        ).upper()
+
+        if outcome not in ("WIN", "LOSS", "DRAW"):
+            continue
+
+        historical_signal = signals.get(signal_id, {})
+        historical_strategies = historical_signal.get(
+            "matching_strategies", []
+        )
+
+        if isinstance(historical_strategies, str):
+            historical_strategies = [historical_strategies]
+
+        if not isinstance(historical_strategies, list):
+            continue
+
+        for strategy in set(historical_strategies):
+            strategy_stats[strategy][outcome] += 1
+
+    lines = []
+
+    for strategy in strategies:
+        stats = strategy_stats[strategy]
+
+        wins = stats["WIN"]
+        losses = stats["LOSS"]
+        decisive = wins + losses
+
+        if decisive > 0:
+            rate = wins / decisive * 100
+            rate_text = f"{rate:.1f}%"
+            sample_text = f"{decisive} صفقة حاسمة"
+        else:
+            rate_text = "غير متوفرة بعد"
+            sample_text = "لا توجد نتائج حاسمة"
+
+        lines.append(
+            f"• {strategy}: {rate_text} ({sample_text})"
+        )
+
+    return "\n".join(lines)
+
+
+def format_compact_signal(signal, phase):
+    duration_label, _ = format_duration(signal)
+
+    symbol = signal.get("symbol", "غير محدد")
+    direction = signal.get("direction", "غير محدد")
+    entry_time = signal.get("entry_time", "غير محدد")
+
+    strategy_text = format_strategy_performance(signal)
+
+    if phase == "PRE_ALERT":
+        heading = "🔔 فرصة OTC قادمة"
+    else:
+        heading = "✅ تأكيد الإشارة التجريبية"
+
+    return (
+        f"{heading}\n\n"
+        f"📊 الأداة: {symbol}\n"
+        f"📈 الاتجاه: {direction}\n"
+        f"🕒 موعد الدخول: {entry_time}\n"
+        f"⏱️ مدة الصفقة: {duration_label}\n\n"
+        f"📚 الاستراتيجية ونسبة نجاحها التاريخية:\n"
+        f"{strategy_text}\n\n"
+        "⚠️ جميع الإشارات والنتائج تجريبية."
+    )
+
+
 # --------------------------------------------------
 # TRADE HISTORY
 # --------------------------------------------------
@@ -434,6 +530,9 @@ def build_stats_message(data):
         signal = signals.get(signal_id, {})
         strategies = signal.get("matching_strategies", [])
 
+        if isinstance(strategies, str):
+            strategies = [strategies]
+
         for strategy in set(strategies):
             strategy_stats[strategy][result["outcome"]] += 1
 
@@ -640,73 +739,42 @@ async def start_scanner_task(app):
 
     async def notify(signal):
         phase = signal_phase(signal)
-        strategies_text = format_signal_details(signal)
-        ai_text = format_ai_shadow(signal)
-
-        duration_label, duration_reason = format_duration(
-            signal
-        )
 
         if phase == "PRE_ALERT":
-            entry_time = (
-                signal.get("entry_time")
-                or "غير محدد"
+            message = format_compact_signal(
+                signal,
+                "PRE_ALERT"
             )
 
-            confirm_time = signal.get(
-                "confirm_time",
-                "قبل الدخول بـ15 ثانية"
+            await send_to_subscribers(
+                app,
+                message
             )
 
-            message = (
-                "🔔 تنبيه فرصة OTC قادمة\n\n"
-                f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
-                f"الاتجاه المتوقع: {signal.get('direction', 'غير محدد')}\n"
-                f"وقت التنبيه: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
-                f"موعد التأكيد: {confirm_time}\n"
-                f"موعد الدخول المقترح: {entry_time}\n\n"
-                f"⏱️ المدة المختارة تجريبياً: {duration_label}\n"
-                f"🧠 سبب اختيار المدة: {duration_reason}\n\n"
-                f"{ai_text}\n\n"
-                f"{strategies_text}\n\n"
-                "⏳ سيعيد البوت فحص الإشارة قبل الدخول.\n"
-                "إذا تم التأكيد، سيكون الدخول عند بداية الدقيقة المحددة.\n"
-                "لا تدخل إذا فاتك التوقيت أو لم تستطع التنفيذ."
+            # AI Shadow رسالة مستقلة عن رسالة الإشارة
+            ai_text = format_ai_shadow(signal)
+
+            await send_to_subscribers(
+                app,
+                ai_text
             )
+
+            return True
 
         elif phase == "ENTRY":
-            entry_time = signal.get(
-                "entry_time",
-                "غير محدد"
+            message = format_compact_signal(
+                signal,
+                "ENTRY"
             )
 
-            exit_time = signal.get(
-                "exit_time",
-                "غير محدد"
-            )
-
-            entry_price = signal.get(
-                "entry_price",
-                signal.get("price", "غير محدد")
-            )
-
-            message = (
-                "🚨 تأكيد دخول تجريبي\n\n"
-                f"الأداة: {signal.get('symbol', 'غير محدد')}\n"
-                f"الاتجاه: {signal.get('direction', 'غير محدد')}\n\n"
-                f"🕒 وقت الدخول المحدد: {entry_time}\n"
-                f"⏱️ المدة المختارة: {duration_label}\n"
-                f"🧠 سبب الاختيار: {duration_reason}\n"
-                f"🏁 وقت انتهاء الصفقة: {exit_time}\n"
-                f"💹 السعر المرجعي: {entry_price}\n\n"
-                f"{ai_text}\n\n"
-                f"{strategies_text}\n\n"
-                "📊 سيقارن البوت داخلياً نتيجة 60 و120 ثانية، "
-                "لكن النتيجة الأساسية ستكون للمدة المختارة.\n\n"
-                "⚠️ هذه صفقة افتراضية وليست أمراً للتداول الحقيقي."
+            return await send_to_subscribers(
+                app,
+                message
             )
 
         elif phase == "CANCELLED":
+            strategies_text = format_signal_details(signal)
+
             entry_time = (
                 signal.get("entry_time")
                 or "غير محدد"
@@ -728,17 +796,17 @@ async def start_scanner_task(app):
                 "لم يتم تسجيل صفقة لهذه الفرصة."
             )
 
+            return await send_to_subscribers(
+                app,
+                message
+            )
+
         else:
             logger.error(
                 "Unknown signal phase/status: %s",
                 phase
             )
             return False
-
-        return await send_to_subscribers(
-            app,
-            message
-        )
 
     async def notify_result(result):
         labels = {
