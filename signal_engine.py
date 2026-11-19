@@ -1204,16 +1204,18 @@ def strategy_volatility_squeeze_breakout(candles, average_atr):
         and metrics["range"] <= average_atr * 2.5
     )
 
+    # FIX: Return direction first, followed by the strategy reason.
+    # The analyzer expects (direction, reason) for two-item results.
     if bullish_breakout:
         return (
-            "Volatility Squeeze Breakout",
             "CALL",
+            "Volatility Squeeze Breakout: اختراق صاعد بعد انضغاط التذبذب"
         )
 
     if bearish_breakout:
         return (
-            "Volatility Squeeze Breakout",
             "PUT",
+            "Volatility Squeeze Breakout: اختراق هابط بعد انضغاط التذبذب"
         )
 
     return None
@@ -1475,7 +1477,7 @@ def select_trade_duration(signal):
 
 def analyze_signal(candles_1m, candles_5m=None, symbol=None):
     # All strategies use completed 1-minute candles supplied
-    # by scanner.py. No 5m or future candle data is used.
+    # by the scanner. No 5m or future candle data is used.
 
     candles = valid_candles(candles_1m)
 
