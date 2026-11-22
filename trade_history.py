@@ -5,15 +5,30 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
+from math import isfinite
 
 logger = logging.getLogger(__name__)
 
 HISTORY_FILE = Path(__file__).with_name("trade_history.jsonl")
 _lock = threading.Lock()
 
+VALID_OUTCOMES = {"WIN", "LOSS", "DRAW"}
+VALID_HORIZONS = {60, 120}
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _valid_price(value):
+    if value is None:
+        return True
+
+    try:
+        number = float(value)
+        return isfinite(number) and number > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def write_event(event):
@@ -38,6 +53,10 @@ def write_event(event):
 
 
 def record_signal(signal):
+    if not isinstance(signal, dict) or not signal:
+        logger.error("Invalid signal: expected a non-empty dictionary")
+        return None
+
     signal_id = str(uuid.uuid4())
 
     event = {
@@ -59,12 +78,16 @@ def record_update(signal_id, status, details=None):
     if not signal_id:
         return False
 
+    if not isinstance(status, str) or not status.strip():
+        logger.error("Invalid update status")
+        return False
+
     event = {
         "event": "update",
-        "signal_id": signal_id,
+        "signal_id": str(signal_id),
         "timestamp": utc_now(),
-        "status": status,
-        "details": details or {}
+        "status": status.strip().upper(),
+        "details": details if isinstance(details, dict) else {}
     }
 
     return write_event(event)
@@ -80,21 +103,35 @@ def record_result(
     if not signal_id:
         return False
 
+    normalized_outcome = str(outcome).upper()
+
+    if normalized_outcome not in VALID_OUTCOMES:
+        logger.error("Invalid primary result outcome: %s", outcome)
+        return False
+
+    if not _valid_price(entry_price):
+        logger.error("Invalid primary result entry price")
+        return False
+
+    if not _valid_price(exit_price):
+        logger.error("Invalid primary result exit price")
+        return False
+
     event = {
         "event": "result",
-        "signal_id": signal_id,
+        "signal_id": str(signal_id),
         "timestamp": utc_now(),
-        "outcome": str(outcome).upper(),
+        "outcome": normalized_outcome,
         "entry_price": entry_price,
         "exit_price": exit_price,
-        "details": details or {}
+        "details": details if isinstance(details, dict) else {}
     }
 
     if write_event(event):
         logger.info(
             "Trade result saved: %s = %s",
             signal_id,
-            outcome
+            normalized_outcome
         )
         return True
 
@@ -112,7 +149,13 @@ def record_horizon_result(
     if not signal_id:
         return False
 
-    if horizon_seconds not in (60, 120):
+    try:
+        horizon_seconds = int(horizon_seconds)
+    except (TypeError, ValueError):
+        logger.error("Invalid result horizon: %s", horizon_seconds)
+        return False
+
+    if horizon_seconds not in VALID_HORIZONS:
         logger.error(
             "Unsupported result horizon: %s",
             horizon_seconds
@@ -121,23 +164,31 @@ def record_horizon_result(
 
     normalized_outcome = str(outcome).upper()
 
-    if normalized_outcome not in ("WIN", "LOSS", "DRAW"):
+    if normalized_outcome not in VALID_OUTCOMES:
         logger.error(
             "Invalid horizon outcome: %s",
             normalized_outcome
         )
         return False
 
+    if not _valid_price(entry_price):
+        logger.error("Invalid horizon entry price")
+        return False
+
+    if not _valid_price(exit_price):
+        logger.error("Invalid horizon exit price")
+        return False
+
     event = {
         "event": "horizon_result",
         "schema_version": 1,
-        "signal_id": signal_id,
+        "signal_id": str(signal_id),
         "timestamp": utc_now(),
         "horizon_seconds": horizon_seconds,
         "outcome": normalized_outcome,
         "entry_price": entry_price,
         "exit_price": exit_price,
-        "details": details or {}
+        "details": details if isinstance(details, dict) else {}
     }
 
     if write_event(event):
