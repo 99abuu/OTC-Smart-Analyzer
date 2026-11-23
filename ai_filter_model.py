@@ -9,9 +9,11 @@ from ai_model import (
     MIN_TRAINING_SAMPLES,
     _eligible_records,
     _parse_timestamp,
-    _temporal_validation_records,
+    baseline_metrics,
+    classification_metrics,
     extract_features,
     read_training_records,
+    walk_forward_splits,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,15 +21,13 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = "KNN_Shadow_v2"
 MODEL_VERSION = 2
 
-VALIDATION_FRACTION = 0.20
-MIN_VALIDATION_SAMPLES = 8
-
 MIN_NEIGHBORS = 5
 MAX_NEIGHBORS = 15
 DISTANCE_EPSILON = 0.05
 FEATURE_COUNT = 14
 STANDARD_DEVIATION_FLOOR = 0.05
 STANDARDIZED_FEATURE_CLIP = 5.0
+MIN_VALIDATION_SAMPLES = 8
 
 
 def _class_counts(dataset):
@@ -129,93 +129,98 @@ def predict_probability(dataset, features, scaler=None):
     }
 
 
-def _calculate_metrics(predictions):
-    total = len(predictions)
-    if total == 0:
-        return {"samples": 0, "accuracy": None, "brier_score": None, "log_loss": None}
-    correct = 0
-    brier_total = 0.0
-    log_loss_total = 0.0
-    epsilon = 1e-9
-    for probability, target in predictions:
-        if (1.0 if probability >= 0.5 else 0.0) == target:
-            correct += 1
-        brier_total += (probability - target) ** 2
-        safe_probability = max(epsilon, min(1.0 - epsilon, probability))
-        log_loss_total += -(target * math.log(safe_probability) + (1.0 - target) * math.log(1.0 - safe_probability))
-    return {
-        "samples": total,
-        "accuracy": round(correct / total * 100.0, 2),
-        "brier_score": round(brier_total / total, 5),
-        "log_loss": round(log_loss_total / total, 5),
-    }
-
-
 def temporal_validation(records):
     """
-    Strict chronological holdout. Validation labels are never included in
-    scaler fitting or neighbor selection. Training labels must be available
-    before the first validation signal timestamp.
+    Expanding-window walk-forward validation.
+    Each fold fits its scaler and neighbors from training data only.
     """
-    total = len(records)
-    validation_count = max(MIN_VALIDATION_SAMPLES, int(total * VALIDATION_FRACTION))
-    split_index = total - validation_count
-    if split_index <= 0 or validation_count < MIN_VALIDATION_SAMPLES:
+    splits = walk_forward_splits(records)
+    if not splits:
         return {
             "status": "NOT_ENOUGH_DATA", "samples": 0, "accuracy": None,
-            "brier_score": None, "log_loss": None,
-            "training_samples_before_validation": max(0, split_index),
-            "validation_candidates": max(0, validation_count),
+            "precision": None, "recall": None, "specificity": None,
+            "balanced_accuracy": None, "f1": None, "brier_score": None,
+            "log_loss": None, "folds_completed": 0, "folds_skipped": 0,
+            "evaluation": "WALK_FORWARD_EXPANDING_WINDOW",
         }
 
-    validation_rows = records[split_index:]
-    validation_start = validation_rows[0]["signal_ts"]
-    training_rows = [
-        row for row in records[:split_index]
-        if row["signal_ts"] < validation_start and row["label_ts"] < validation_start
-    ]
-    training = [(row["features"], row["target"]) for row in training_rows]
-    status = _data_status(training)
-    if status["status"] != "READY":
-        return {
-            "status": status["status"], "samples": 0, "accuracy": None,
-            "brier_score": None, "log_loss": None,
-            "training_samples_before_validation": len(training),
-            "validation_candidates": len(validation_rows),
-        }
+    all_predictions = []
+    all_baseline_predictions = []
+    fold_reports = []
+    folds_skipped = 0
 
-    scaler = _fit_scaler(training)
-    predictions = []
-    skipped = 0
-    for row in validation_rows:
-        estimate = predict_probability(training, row["features"], scaler=scaler)
-        if estimate is None:
-            skipped += 1
+    for split in splits:
+        training = [(row["features"], row["target"]) for row in split["training_rows"]]
+        validation = [(row["features"], row["target"]) for row in split["validation_rows"]]
+        status = _data_status(training)
+        if status["status"] != "READY":
+            folds_skipped += 1
+            fold_reports.append({
+                "fold": split["fold"], "status": status["status"], "samples": 0
+            })
             continue
-        predictions.append((estimate["probability"], row["target"]))
 
-    metrics = _calculate_metrics(predictions)
+        scaler = _fit_scaler(training)
+        fold_predictions = []
+        for features, target in validation:
+            estimate = predict_probability(training, features, scaler=scaler)
+            if estimate is not None:
+                fold_predictions.append((estimate["probability"], target))
+
+        baseline_probability = status["wins"] / status["samples"]
+        baseline_predictions = [
+            (baseline_probability, target) for _, target in validation
+        ]
+        all_predictions.extend(fold_predictions)
+        all_baseline_predictions.extend(baseline_predictions)
+
+        model_metrics = classification_metrics(fold_predictions)
+        baseline = baseline_metrics(training, validation)
+        fold_reports.append({
+            "fold": split["fold"],
+            "status": "READY" if len(fold_predictions) >= MIN_VALIDATION_SAMPLES else "LOW_VALIDATION_COUNT",
+            "training_samples": len(training),
+            "validation_start": datetime.fromtimestamp(
+                split["validation_start"], timezone.utc
+            ).isoformat(),
+            "model": model_metrics,
+            "baseline": baseline,
+        })
+
+    metrics = classification_metrics(all_predictions)
+    baseline_all = classification_metrics(all_baseline_predictions)
     metrics.update({
-        "status": "READY" if len(predictions) >= MIN_VALIDATION_SAMPLES else "NOT_ENOUGH_VALIDATION_DATA",
-        "training_samples_before_validation": len(training),
-        "validation_candidates": len(validation_rows),
-        "skipped": skipped,
-        "validation_start": datetime.fromtimestamp(validation_start, timezone.utc).isoformat(),
+        "status": "READY" if metrics["samples"] >= MIN_VALIDATION_SAMPLES else "NOT_ENOUGH_VALIDATION_DATA",
+        "baseline": baseline_all,
+        "folds_completed": len([item for item in fold_reports if item["status"] == "READY"]),
+        "folds_skipped": folds_skipped,
+        "fold_reports": fold_reports,
+        "evaluation": "WALK_FORWARD_EXPANDING_WINDOW",
     })
+    if metrics["samples"] and baseline_all.get("accuracy") is not None:
+        metrics["accuracy_delta_vs_baseline"] = round(
+            metrics["accuracy"] - baseline_all["accuracy"], 2
+        )
+        if metrics["brier_score"] is not None and baseline_all.get("brier_score") is not None:
+            metrics["brier_delta_vs_baseline"] = round(
+                metrics["brier_score"] - baseline_all["brier_score"], 5
+            )
     return metrics
 
 
 def train_model(dataset):
     """Compatibility helper for tuple datasets; timestamped records are preferred."""
     if dataset and isinstance(dataset[0], dict) and "signal_ts" in dataset[0]:
-        records = dataset
-        validation = temporal_validation(records)
-        usable = [(row["features"], row["target"]) for row in records]
+        validation = temporal_validation(dataset)
+        usable = [(row["features"], row["target"]) for row in dataset]
     else:
         usable = dataset
-        validation = {"status": "LEGACY_DATASET_NO_TIMESTAMPS", "samples": 0,
-                      "accuracy": None, "brier_score": None, "log_loss": None,
-                      "training_samples_before_validation": 0}
+        validation = {
+            "status": "LEGACY_DATASET_NO_TIMESTAMPS",
+            "samples": 0, "accuracy": None, "precision": None, "recall": None,
+            "specificity": None, "balanced_accuracy": None, "f1": None,
+            "brier_score": None, "log_loss": None,
+        }
     info = _data_status(usable)
     info["validation"] = validation
     info["model"] = MODEL_NAME
