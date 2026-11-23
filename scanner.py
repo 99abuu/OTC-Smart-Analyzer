@@ -2559,6 +2559,7 @@ async def scanner_loop(
                             )
                             continue
 
+                
                     # ----------------------------------
                     # START PAPER TRADE
                     # ----------------------------------
@@ -2593,28 +2594,28 @@ async def scanner_loop(
                             "selected_duration_seconds"
                         ]
 
-                   pending_trades[symbol] = {
-    "symbol": symbol,
-    "direction": signal["direction"],
-    "entry_price": price,
-    "entry_time": timestamp,
-    "strategies": list(
-        signal.get("matching_strategies", [])
-    ),
-    "strategy_reasons": list(
-        signal.get("strategy_reasons", [])
-    ),
-    "history_id": alert.get("history_id"),
-    "selected_duration_seconds": selected_duration,
-    "duration_reason": alert["duration_reason"],
-    "processed_horizons": set(),
-    "primary_result_saved": False,
-    "primary_result_unresolved": False,
-    "primary_result_delivered": False,
-    "primary_result_data": None,
-    "primary_result_details": None,
-    "comparison_completed": False
-}
+                        pending_trades[symbol] = {
+                            "symbol": symbol,
+                            "direction": signal["direction"],
+                            "entry_price": price,
+                            "entry_time": timestamp,
+                            "strategies": list(
+                                signal.get("matching_strategies", [])
+                            ),
+                            "strategy_reasons": list(
+                                signal.get("strategy_reasons", [])
+                            ),
+                            "history_id": alert.get("history_id"),
+                            "selected_duration_seconds": selected_duration,
+                            "duration_reason": alert["duration_reason"],
+                            "processed_horizons": set(),
+                            "primary_result_saved": False,
+                            "primary_result_unresolved": False,
+                            "primary_result_delivered": False,
+                            "primary_result_data": None,
+                            "primary_result_details": None,
+                            "comparison_completed": False
+                        }
 
                         safe_record_update(
                             alert.get("history_id"),
@@ -2642,6 +2643,7 @@ async def scanner_loop(
 
                         pending_alerts.pop(symbol, None)
                         continue
+
 
                 # ----------------------------------
                 # DO NOT ANALYZE DURING OPEN TRADE
