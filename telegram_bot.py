@@ -10,7 +10,9 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    BotCommand,
+    MenuButtonCommands
 )
 
 from telegram.ext import (
@@ -1856,6 +1858,27 @@ async def post_init(app):
     app.bot_data["selection_queue"] = asyncio.Queue()
     app.bot_data["scanner_task"] = None
     app.bot_data["last_selection"] = None
+
+    # تسجيل أوامر البوت في قائمة أوامر Telegram
+    await app.bot.set_my_commands([
+        BotCommand("start", "بدء البوت"),
+        BotCommand("status", "حالة البوت"),
+        BotCommand("markets", "اختيار الأسواق"),
+        BotCommand("analyze", "تحليل يدوي"),
+        BotCommand("testsymbols", "قائمة أدوات OTC"),
+        BotCommand("stats", "إحصائيات الأداء"),
+        BotCommand("exporthistory", "تصدير سجل الصفقات"),
+        BotCommand("stop", "إيقاف الماسح")
+    ])
+
+    # إظهار قائمة الأوامر عند الضغط على زر Menu في Telegram
+    await app.bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
+    )
+
+    logger.info(
+        "Telegram commands menu configured successfully."
+    )
 
     logger.info(
         "Telegram bot initialized. Waiting for controller."
