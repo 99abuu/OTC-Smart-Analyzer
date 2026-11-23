@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import threading
@@ -55,6 +54,8 @@ OTC_TICK_TIME_OFFSET_SECONDS = 7200
 MAX_CANDLE_START_DELAY = 2
 
 LOCAL_TIMEZONE = ZoneInfo("Europe/Nicosia")
+
+STOP_SETTLEMENT_TIMEOUT = 180
 
 _candidate_rotation_offset = 0
 
@@ -123,6 +124,28 @@ async def send_status_message(send_status, message):
         await send_status(message)
     except Exception:
         logger.exception("Status notification failed")
+
+
+def safe_record_update(history_id, status, details=None):
+    if not history_id:
+        return False
+
+    try:
+        result = record_update(
+            history_id,
+            status,
+            details or {}
+        )
+
+        return result is not False
+
+    except Exception:
+        logger.exception(
+            "History update failed: %s | %s",
+            history_id,
+            status
+        )
+        return False
 
 
 # --------------------------------------------------
@@ -1107,9 +1130,7 @@ def validate_pending_signal(
         return False, "تحرك السعر بعيداً عن نقطة الإشارة"
 
     return True, "تم تأكيد الإشارة مع ثبات الاستراتيجية والسعر"
-
-
-# --------------------------------------------------
+    # --------------------------------------------------
 # MAIN SCANNER
 # --------------------------------------------------
 
@@ -1180,6 +1201,7 @@ async def scanner_loop(
 
     initial_selection = None
     selection_mode = None
+    initial_histories = {}
 
     while initial_selection is None:
         try:
@@ -1291,7 +1313,6 @@ async def scanner_loop(
     }
 
     current_1m = {}
-
     current_1m_complete = {}
 
     data_ready = {
@@ -1327,6 +1348,7 @@ async def scanner_loop(
 
     pending_selection = None
     stop_requested = False
+    stop_requested_at = None
 
     next_refresh = (
         time.monotonic() + MARKET_REFRESH_SECONDS
@@ -1343,7 +1365,7 @@ async def scanner_loop(
         message["status"] = "CANCELLED"
         message["reason"] = reason
 
-        record_update(
+        safe_record_update(
             alert.get("history_id"),
             "CANCELLED",
             {"reason": reason}
@@ -1431,7 +1453,8 @@ async def scanner_loop(
                 "market selection postponed"
             )
 
-            stop_event.clear()
+            # لا نمسح stop_event هنا.
+            # يجب أن يتوقف العامل القديم قبل إنشاء عامل جديد.
             return False
 
         symbols = new_symbols
@@ -1493,6 +1516,7 @@ async def scanner_loop(
     async def process_control_commands():
         nonlocal pending_selection
         nonlocal stop_requested
+        nonlocal stop_requested_at
 
         while True:
             try:
@@ -1508,6 +1532,7 @@ async def scanner_loop(
             if mode == "stop":
                 if not stop_requested:
                     stop_requested = True
+                    stop_requested_at = time.monotonic()
 
                     logger.info(
                         "STOP requested: preventing new signals"
@@ -1660,6 +1685,290 @@ async def scanner_loop(
                         )
 
     # ----------------------------------------------
+    # PAPER TRADE RESULT PROCESSING
+    # ----------------------------------------------
+
+    async def process_trade_results(symbol, trade, timestamp, price):
+        """
+        يحاول حفظ نتائج كل مدة بشكل مستقل.
+
+        لا تعتبر المدة مكتملة إلا بعد نجاح حفظها.
+        وتتم إعادة محاولة حفظ النتيجة الأساسية حتى تنجح.
+        """
+
+        for horizon in COMPARISON_DURATIONS:
+
+            if horizon in trade["processed_horizons"]:
+                continue
+
+            target_time = trade["entry_time"] + horizon
+
+            if timestamp < target_time:
+                continue
+
+            delay = timestamp - target_time
+
+            if delay > MAX_HORIZON_DELAY:
+                missed_saved = safe_record_update(
+                    trade.get("history_id"),
+                    "HORIZON_RESULT_MISSED",
+                    {
+                        "horizon_seconds": horizon,
+                        "target_time": target_time,
+                        "observed_time": timestamp,
+                        "delay_seconds": delay
+                    }
+                )
+
+                if missed_saved:
+                    trade["processed_horizons"].add(horizon)
+
+                    logger.warning(
+                        "HORIZON RESULT MISSED: %s | "
+                        "%ss | tick delayed by %ss",
+                        symbol,
+                        horizon,
+                        delay
+                    )
+
+                else:
+                    logger.error(
+                        "HORIZON MISSED STATUS SAVE FAILED: %s | %ss",
+                        symbol,
+                        horizon
+                    )
+
+                continue
+
+            outcome = calculate_outcome(
+                trade["direction"],
+                trade["entry_price"],
+                price
+            )
+
+            horizon_details = {
+                "symbol": symbol,
+                "direction": trade["direction"],
+                "strategies": trade.get("strategies", []),
+                "strategy_reasons": trade.get(
+                    "strategy_reasons",
+                    []
+                ),
+                "entry_time": trade["entry_time"],
+                "target_time": target_time,
+                "observed_time": timestamp,
+                "delay_seconds": delay,
+                "measurement_price": price,
+                "selected_duration_seconds": trade[
+                    "selected_duration_seconds"
+                ]
+            }
+
+            try:
+                saved = record_horizon_result(
+                    trade.get("history_id"),
+                    horizon,
+                    outcome,
+                    entry_price=trade["entry_price"],
+                    exit_price=price,
+                    details=horizon_details
+                )
+
+            except Exception:
+                logger.exception(
+                    "HORIZON RESULT SAVE ERROR: %s | %ss",
+                    symbol,
+                    horizon
+                )
+                saved = False
+
+            if not saved:
+                logger.error(
+                    "HORIZON RESULT SAVE FAILED: %s | %ss",
+                    symbol,
+                    horizon
+                )
+                continue
+
+            trade["processed_horizons"].add(horizon)
+
+            logger.info(
+                "HORIZON RESULT: %s | %ss | %s | "
+                "entry=%s | exit=%s | delay=%ss",
+                symbol,
+                horizon,
+                outcome,
+                trade["entry_price"],
+                price,
+                delay
+            )
+
+            if horizon == trade["selected_duration_seconds"]:
+                trade["primary_result_data"] = {
+                    "symbol": symbol,
+                    "direction": trade["direction"],
+                    "entry_price": trade["entry_price"],
+                    "exit_price": price,
+                    "entry_time": format_time(
+                        trade["entry_time"]
+                    ),
+                    "exit_time": format_time(timestamp),
+                    "result": outcome,
+                    "duration_seconds": horizon,
+                    "duration_reason": trade.get(
+                        "duration_reason",
+                        ""
+                    ),
+                    "strategies": trade.get("strategies", []),
+                    "strategy_reasons": trade.get(
+                        "strategy_reasons",
+                        []
+                    )
+                }
+
+                trade["primary_result_details"] = horizon_details
+
+        # ------------------------------------------
+        # RETRY PRIMARY RESULT SAVE
+        # ------------------------------------------
+
+        if (
+            trade.get("primary_result_data")
+            and not trade.get("primary_result_saved")
+        ):
+            primary = trade["primary_result_data"]
+
+            try:
+                primary_saved = record_result(
+                    trade.get("history_id"),
+                    primary["result"],
+                    entry_price=primary["entry_price"],
+                    exit_price=primary["exit_price"],
+                    details=trade.get(
+                        "primary_result_details",
+                        {}
+                    )
+                )
+
+            except Exception:
+                logger.exception(
+                    "PRIMARY RESULT SAVE ERROR: %s",
+                    symbol
+                )
+                primary_saved = False
+
+            if primary_saved:
+                trade["primary_result_saved"] = True
+
+                logger.info(
+                    "PRIMARY RESULT SAVED: %s | %s | %s",
+                    symbol,
+                    primary["duration_seconds"],
+                    primary["result"]
+                )
+
+            else:
+                logger.error(
+                    "PRIMARY RESULT SAVE FAILED; WILL RETRY: %s",
+                    symbol
+                )
+
+        # ------------------------------------------
+        # DELIVER PRIMARY RESULT AFTER SAVING
+        # ------------------------------------------
+
+        if (
+            trade.get("primary_result_saved")
+            and not trade.get("primary_result_delivered")
+        ):
+            primary = trade.get("primary_result_data")
+
+            if primary:
+                try:
+                    delivery_response = await send_result(primary)
+delivered = delivery_response is not False
+
+                except Exception:
+                    logger.exception(
+                        "Selected-duration result delivery failed: %s",
+                        symbol
+                    )
+                    delivered = False
+
+                if delivered:
+                    trade["primary_result_delivered"] = True
+
+                    safe_record_update(
+                        trade.get("history_id"),
+                        "PRIMARY_RESULT_DELIVERED",
+                        {
+                            "duration_seconds": primary[
+                                "duration_seconds"
+                            ],
+                            "result": primary["result"]
+                        }
+                    )
+
+                    logger.info(
+                        "PAPER RESULT DELIVERED: %s | %s | %s",
+                        symbol,
+                        primary["duration_seconds"],
+                        primary["result"]
+                    )
+
+                else:
+                    logger.warning(
+                        "PRIMARY RESULT NOT DELIVERED; "
+                        "WILL RETRY: %s",
+                        symbol
+                    )
+
+        # ------------------------------------------
+        # COMPLETION CHECK
+        # ------------------------------------------
+
+        horizons_completed = all(
+            horizon in trade["processed_horizons"]
+            for horizon in COMPARISON_DURATIONS
+        )
+
+        primary_horizon = trade["selected_duration_seconds"]
+
+        primary_horizon_completed = (
+            primary_horizon in trade["processed_horizons"]
+        )
+
+        if (
+            horizons_completed
+            and primary_horizon_completed
+            and trade.get("primary_result_saved")
+        ):
+            if not trade.get("comparison_completed"):
+                comparison_saved = safe_record_update(
+                    trade.get("history_id"),
+                    "DURATION_COMPARISON_COMPLETED",
+                    {
+                        "durations": list(COMPARISON_DURATIONS),
+                        "selected_duration_seconds": primary_horizon
+                    }
+                )
+
+                if comparison_saved:
+                    trade["comparison_completed"] = True
+
+                    logger.info(
+                        "DURATION COMPARISON COMPLETED: %s",
+                        symbol
+                    )
+
+            if trade.get("comparison_completed"):
+                pending_trades.pop(symbol, None)
+
+                logger.info(
+                    "PAPER TRADE REMOVED FROM PENDING: %s",
+                    symbol
+                )
+                    # ----------------------------------------------
     # MAIN LOOP
     # ----------------------------------------------
 
@@ -1682,6 +1991,62 @@ async def scanner_loop(
                         send_status,
                         "تم إيقاف الماسح بعد تسوية الصفقات التجريبية."
                     )
+                    break
+
+                elapsed = (
+                    time.monotonic() - stop_requested_at
+                    if stop_requested_at is not None
+                    else 0
+                )
+
+                if elapsed >= STOP_SETTLEMENT_TIMEOUT:
+                    logger.warning(
+                        "SAFE STOP TIMEOUT: unresolved trades=%s",
+                        list(pending_trades.keys())
+                    )
+
+                    for symbol, trade in list(
+                        pending_trades.items()
+                    ):
+                        safe_record_update(
+                            trade.get("history_id"),
+                            "UNRESOLVED_ON_STOP",
+                            {
+                                "symbol": symbol,
+                                "reason": "STOP_SETTLEMENT_TIMEOUT",
+                                "entry_time": trade.get("entry_time"),
+                                "entry_price": trade.get("entry_price"),
+                                "selected_duration_seconds": trade.get(
+                                    "selected_duration_seconds"
+                                ),
+                                "processed_horizons": sorted(
+                                    trade.get(
+                                        "processed_horizons",
+                                        set()
+                                    )
+                                ),
+                                "primary_result_saved": trade.get(
+                                    "primary_result_saved",
+                                    False
+                                )
+                            }
+                        )
+
+                        logger.warning(
+                            "PAPER TRADE LEFT UNRESOLVED: %s | "
+                            "no WIN/LOSS result was fabricated",
+                            symbol
+                        )
+
+                        pending_trades.pop(symbol, None)
+
+                    await send_status_message(
+                        send_status,
+                        "انتهت مهلة انتظار الصفقات التجريبية. "
+                        "تم تسجيل الصفقات غير المحسومة دون احتساب "
+                        "أي نتيجة ربح أو خسارة."
+                    )
+
                     break
 
             # --------------------------------------
@@ -1812,181 +2177,12 @@ async def scanner_loop(
                 trade = pending_trades.get(symbol)
 
                 if trade:
-                    for horizon in COMPARISON_DURATIONS:
-
-                        if horizon in trade["processed_horizons"]:
-                            continue
-
-                        target_time = (
-                            trade["entry_time"] + horizon
-                        )
-
-                        if timestamp < target_time:
-                            continue
-
-                        delay = timestamp - target_time
-
-                        if delay > MAX_HORIZON_DELAY:
-                            record_update(
-                                trade.get("history_id"),
-                                "HORIZON_RESULT_MISSED",
-                                {
-                                    "horizon_seconds": horizon,
-                                    "target_time": target_time,
-                                    "observed_time": timestamp,
-                                    "delay_seconds": delay
-                                }
-                            )
-
-                            logger.warning(
-                                "HORIZON RESULT MISSED: %s | "
-                                "%ss | tick delayed by %ss",
-                                symbol,
-                                horizon,
-                                delay
-                            )
-
-                            trade["processed_horizons"].add(horizon)
-                            continue
-
-                        outcome = calculate_outcome(
-                            trade["direction"],
-                            trade["entry_price"],
-                            price
-                        )
-
-                        horizon_details = {
-                            "symbol": symbol,
-                            "direction": trade["direction"],
-                            "strategies": trade.get("strategies", []),
-                            "strategy_reasons": trade.get(
-                                "strategy_reasons",
-                                []
-                            ),
-                            "entry_time": trade["entry_time"],
-                            "target_time": target_time,
-                            "observed_time": timestamp,
-                            "delay_seconds": delay,
-                            "measurement_price": price,
-                            "selected_duration_seconds": trade[
-                                "selected_duration_seconds"
-                            ]
-                        }
-
-                        saved = record_horizon_result(
-                            trade.get("history_id"),
-                            horizon,
-                            outcome,
-                            entry_price=trade["entry_price"],
-                            exit_price=price,
-                            details=horizon_details
-                        )
-
-                        if saved:
-                            trade["processed_horizons"].add(horizon)
-
-                            logger.info(
-                                "HORIZON RESULT: %s | %ss | %s | "
-                                "entry=%s | exit=%s | delay=%ss",
-                                symbol,
-                                horizon,
-                                outcome,
-                                trade["entry_price"],
-                                price,
-                                delay
-                            )
-
-                        else:
-                            logger.error(
-                                "HORIZON RESULT SAVE FAILED: %s | %ss",
-                                symbol,
-                                horizon
-                            )
-
-                        if (
-                            horizon == trade["selected_duration_seconds"]
-                            and saved
-                            and not trade.get("primary_result_saved")
-                        ):
-                            result_data = {
-                                "symbol": symbol,
-                                "direction": trade["direction"],
-                                "entry_price": trade["entry_price"],
-                                "exit_price": price,
-                                "entry_time": format_time(
-                                    trade["entry_time"]
-                                ),
-                                "exit_time": format_time(timestamp),
-                                "result": outcome,
-                                "duration_seconds": horizon,
-                                "duration_reason": trade.get(
-                                    "duration_reason",
-                                    ""
-                                ),
-                                "strategies": trade.get("strategies", []),
-                                "strategy_reasons": trade.get(
-                                    "strategy_reasons",
-                                    []
-                                )
-                            }
-
-                            primary_saved = record_result(
-                                trade.get("history_id"),
-                                outcome,
-                                entry_price=trade["entry_price"],
-                                exit_price=price,
-                                details=horizon_details
-                            )
-
-                            if primary_saved:
-                                trade["primary_result_saved"] = True
-
-                                try:
-                                    await send_result(result_data)
-                                except Exception:
-                                    logger.exception(
-                                        "Selected-duration result "
-                                        "delivery failed: %s",
-                                        symbol
-                                    )
-
-                                logger.info(
-                                    "PAPER RESULT %ss: %s | %s | %s | "
-                                    "Strategies=%s",
-                                    horizon,
-                                    symbol,
-                                    trade["direction"],
-                                    outcome,
-                                    trade.get("strategies", [])
-                                )
-
-                            else:
-                                logger.error(
-                                    "PRIMARY RESULT SAVE FAILED: %s",
-                                    symbol
-                                )
-
-                    if all(
-                        horizon in trade["processed_horizons"]
-                        for horizon in COMPARISON_DURATIONS
-                    ):
-                        record_update(
-                            trade.get("history_id"),
-                            "DURATION_COMPARISON_COMPLETED",
-                            {
-                                "durations": list(COMPARISON_DURATIONS),
-                                "selected_duration_seconds": trade[
-                                    "selected_duration_seconds"
-                                ]
-                            }
-                        )
-
-                        logger.info(
-                            "DURATION COMPARISON COMPLETED: %s",
-                            symbol
-                        )
-
-                        pending_trades.pop(symbol, None)
+                    await process_trade_results(
+                        symbol,
+                        trade,
+                        timestamp,
+                        price
+                    )
 
                 # ----------------------------------
                 # BUILD LIVE ONE-MINUTE CANDLES
@@ -2258,7 +2454,7 @@ async def scanner_loop(
                                 delivered = False
 
                             if not delivered:
-                                record_update(
+                                safe_record_update(
                                     alert.get("history_id"),
                                     "ENTRY_NOT_DELIVERED"
                                 )
@@ -2274,7 +2470,7 @@ async def scanner_loop(
 
                             alert["status"] = "CONFIRMED"
 
-                            record_update(
+                            safe_record_update(
                                 alert.get("history_id"),
                                 "CONFIRMED",
                                 {
@@ -2355,10 +2551,14 @@ async def scanner_loop(
                             "selected_duration_seconds": selected_duration,
                             "duration_reason": alert["duration_reason"],
                             "processed_horizons": set(),
-                            "primary_result_saved": False
+                            "primary_result_saved": False,
+                            "primary_result_delivered": False,
+                            "primary_result_data": None,
+                            "primary_result_details": None,
+                            "comparison_completed": False
                         }
 
-                        record_update(
+                        safe_record_update(
                             alert.get("history_id"),
                             "PAPER_TRADE_STARTED",
                             {
@@ -2509,8 +2709,74 @@ async def scanner_loop(
                     entry_at + selected_duration
                 )
 
+                # ----------------------------------
+                # SAVE SIGNAL BEFORE PRE-ALERT
+                # ----------------------------------
+
+                try:
+                    history_id = record_signal(signal)
+
+                except Exception:
+                    logger.exception(
+                        "SIGNAL HISTORY SAVE ERROR: %s",
+                        symbol
+                    )
+                    history_id = None
+
+                if not history_id:
+                    logger.error(
+                        "SIGNAL HISTORY NOT SAVED: %s | "
+                        "PRE-ALERT WILL NOT BE SENT",
+                        symbol
+                    )
+                    continue
+
+                alert["history_id"] = history_id
+
+                safe_record_update(
+                    history_id,
+                    "PRE_ALERT_PENDING_DELIVERY",
+                    {
+                        "entry_at": entry_at,
+                        "confirm_at": confirm_at,
+                        "duration_seconds": selected_duration,
+                        "selected_duration_seconds": selected_duration,
+                        "duration_reason": duration_reason,
+                        "comparison_durations": list(
+                            COMPARISON_DURATIONS
+                        )
+                    }
+                )
+
+                # ----------------------------------
+                # SAVE KNN SHADOW EVALUATION
+                # ----------------------------------
+
+                safe_record_update(
+                    history_id,
+                    "KNN_SHADOW_EVALUATED",
+                    {
+                        "model": "KNN_Shadow_v1",
+                        "evaluation": signal.get(
+                            "ai_filter_shadow",
+                            {}
+                        )
+                    }
+                )
+
+                logger.info(
+                    "KNN SHADOW SAVED: %s | history_id=%s",
+                    symbol,
+                    history_id
+                )
+
+                # ----------------------------------
+                # SEND PRE-ALERT AFTER HISTORY SAVE
+                # ----------------------------------
+
                 try:
                     delivered = await send_signal(message)
+
                 except Exception:
                     logger.exception(
                         "Pre-alert delivery failed for %s",
@@ -2519,65 +2785,32 @@ async def scanner_loop(
                     delivered = False
 
                 if not delivered:
+                    safe_record_update(
+                        history_id,
+                        "PRE_ALERT_NOT_DELIVERED"
+                    )
+
                     logger.warning(
-                        "PRE-ALERT NOT DELIVERED; "
-                        "SIGNAL DISCARDED: %s",
+                        "PRE-ALERT NOT DELIVERED: %s | "
+                        "signal saved but not activated",
                         symbol
                     )
                     continue
 
-                # ----------------------------------
-                # SAVE SIGNAL AND AI PREDICTIONS
-                # ----------------------------------
-
-                history_id = record_signal(signal)
-                alert["history_id"] = history_id
-
-                if history_id:
-                    record_update(
-                        history_id,
-                        "PRE_ALERT_DELIVERED",
-                        {
-                            "entry_at": entry_at,
-                            "confirm_at": confirm_at,
-                            "duration_seconds": selected_duration,
-                            "selected_duration_seconds": selected_duration,
-                            "duration_reason": duration_reason,
-                            "comparison_durations": list(
-                                COMPARISON_DURATIONS
-                            )
-                        }
-                    )
-
-                    # ----------------------------------
-                    # SAVE KNN SHADOW EVALUATION
-                    # ----------------------------------
-
-                    record_update(
-                        history_id,
-                        "KNN_SHADOW_EVALUATED",
-                        {
-                            "model": "KNN_Shadow_v1",
-                            "evaluation": signal.get(
-                                "ai_filter_shadow",
-                                {}
-                            )
-                        }
-                    )
-
-                    logger.info(
-                        "KNN SHADOW SAVED: %s | history_id=%s",
-                        symbol,
-                        history_id
-                    )
-
-                else:
-                    logger.error(
-                        "SIGNAL HISTORY NOT SAVED: %s | "
-                        "signal will not be activated",
-                        symbol
-                    )
-                    continue
+                safe_record_update(
+                    history_id,
+                    "PRE_ALERT_DELIVERED",
+                    {
+                        "entry_at": entry_at,
+                        "confirm_at": confirm_at,
+                        "duration_seconds": selected_duration,
+                        "selected_duration_seconds": selected_duration,
+                        "duration_reason": duration_reason,
+                        "comparison_durations": list(
+                            COMPARISON_DURATIONS
+                        )
+                    }
+                )
 
                 pending_alerts[symbol] = alert
                 last_signal_time[symbol] = timestamp
@@ -2603,5 +2836,10 @@ async def scanner_loop(
             worker.join,
             5
         )
+
+        if worker.is_alive():
+            logger.warning(
+                "OTC stream worker is still alive after shutdown timeout"
+            )
 
         logger.info("OTC scanner stopped")
