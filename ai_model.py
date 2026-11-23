@@ -25,6 +25,9 @@ MIN_VALIDATION_SAMPLES = 8
 VALIDATION_MIN_TRAINING_SAMPLES = 25
 VALIDATION_MIN_CLASS_SAMPLES = 6
 
+WALK_FORWARD_FOLDS = 4
+WALK_FORWARD_INITIAL_FRACTION = 0.50
+
 
 def safe_number(value, default=0.0):
     try:
@@ -173,7 +176,6 @@ def read_training_records(history_file=None):
                     label_ts = _parse_timestamp(event.get("timestamp"))
                     if outcome not in ("WIN", "LOSS") or label_ts is None:
                         continue
-                    # Keep the first valid definitive label for each signal/horizon.
                     labels[horizon].setdefault(signal_id, (outcome, label_ts))
     except OSError:
         logger.exception("Could not read AI training history")
@@ -267,73 +269,193 @@ def _fit_logistic(dataset, min_samples, min_class_samples):
     return weights, {"status": "READY", "samples": total, "wins": wins, "losses": losses}
 
 
-def _validation_metrics(weights, dataset):
-    total = len(dataset)
+def classification_metrics(predictions):
+    """Metrics for (probability, target) pairs; WIN is the positive class."""
+    total = len(predictions)
     if not total:
-        return {"samples": 0, "accuracy": None, "brier_score": None, "log_loss": None}
-    correct = 0
+        return {
+            "samples": 0, "wins": 0, "losses": 0, "accuracy": None,
+            "precision": None, "recall": None, "specificity": None,
+            "balanced_accuracy": None, "f1": None,
+            "brier_score": None, "log_loss": None,
+        }
+
+    tp = fp = tn = fn = 0
     brier_total = 0.0
     log_loss_total = 0.0
     epsilon = 1e-9
-    for features, target in dataset:
-        probability = predict_probability(weights, features)
-        if (1.0 if probability >= 0.5 else 0.0) == target:
-            correct += 1
+    for probability, target in predictions:
+        probability = max(epsilon, min(1.0 - epsilon, float(probability)))
+        predicted = 1.0 if probability >= 0.5 else 0.0
+        if predicted == 1.0 and target == 1.0:
+            tp += 1
+        elif predicted == 1.0 and target == 0.0:
+            fp += 1
+        elif predicted == 0.0 and target == 0.0:
+            tn += 1
+        else:
+            fn += 1
         brier_total += (probability - target) ** 2
-        safe_probability = clamp(probability, epsilon, 1.0 - epsilon)
-        log_loss_total += -(target * math.log(safe_probability) + (1.0 - target) * math.log(1.0 - safe_probability))
+        log_loss_total += -(target * math.log(probability) + (1.0 - target) * math.log(1.0 - probability))
+
+    wins = tp + fn
+    losses = tn + fp
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / wins if wins else None
+    specificity = tn / losses if losses else None
+    balanced = (
+        (recall + specificity) / 2.0
+        if recall is not None and specificity is not None else None
+    )
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if recall is not None and precision + recall > 0 else 0.0 if recall is not None else None
+    )
     return {
         "samples": total,
-        "accuracy": round(correct / total * 100.0, 2),
+        "wins": wins,
+        "losses": losses,
+        "accuracy": round((tp + tn) / total * 100.0, 2),
+        "precision": round(precision * 100.0, 2),
+        "recall": round(recall * 100.0, 2) if recall is not None else None,
+        "specificity": round(specificity * 100.0, 2) if specificity is not None else None,
+        "balanced_accuracy": round(balanced * 100.0, 2) if balanced is not None else None,
+        "f1": round(f1 * 100.0, 2) if f1 is not None else None,
         "brier_score": round(brier_total / total, 5),
         "log_loss": round(log_loss_total / total, 5),
     }
 
 
-def _temporal_validation_records(records):
+def baseline_metrics(training_dataset, validation_dataset):
+    """
+    Leakage-safe baseline: constant probability equal to the training win rate.
+    Its class decision is the training majority class (threshold 0.5).
+    """
+    wins, losses = _class_counts(training_dataset)
+    total = wins + losses
+    if total == 0:
+        return {"status": "NO_TRAINING_DATA", **classification_metrics([])}
+    probability = wins / total
+    predictions = [(probability, target) for _, target in validation_dataset]
+    result = classification_metrics(predictions)
+    result["status"] = "READY"
+    result["training_win_rate"] = round(probability * 100.0, 2)
+    result["majority_class"] = "WIN" if wins >= losses else "LOSS"
+    result["majority_class_accuracy"] = round(max(wins, losses) / total * 100.0, 2)
+    return result
+
+
+def walk_forward_splits(records, folds=WALK_FORWARD_FOLDS):
+    """
+    Expanding-window chronological folds. Every training label must be known
+    before the first signal in its validation block.
+    """
     total = len(records)
-    validation_count = max(MIN_VALIDATION_SAMPLES, int(total * VALIDATION_FRACTION))
-    split_index = total - validation_count
-    if split_index <= 0 or validation_count < MIN_VALIDATION_SAMPLES:
+    if total < MIN_TRAINING_SAMPLES + MIN_VALIDATION_SAMPLES:
+        return []
+    initial = max(MIN_TRAINING_SAMPLES, int(total * WALK_FORWARD_INITIAL_FRACTION))
+    remaining = total - initial
+    fold_count = min(max(1, int(folds)), remaining // MIN_VALIDATION_SAMPLES)
+    if fold_count < 1:
+        return []
+    block_size = remaining // fold_count
+    splits = []
+    for fold_index in range(fold_count):
+        start = initial + fold_index * block_size
+        end = total if fold_index == fold_count - 1 else min(total, start + block_size)
+        validation_rows = records[start:end]
+        if len(validation_rows) < MIN_VALIDATION_SAMPLES:
+            continue
+        validation_start = validation_rows[0]["signal_ts"]
+        training_rows = [
+            row for row in records[:start]
+            if row["signal_ts"] < validation_start and row["label_ts"] < validation_start
+        ]
+        if len(training_rows) < MIN_TRAINING_SAMPLES:
+            continue
+        splits.append({
+            "fold": fold_index + 1,
+            "training_rows": training_rows,
+            "validation_rows": validation_rows,
+            "validation_start": validation_start,
+        })
+    return splits
+
+
+def _temporal_validation_records(records):
+    """Walk-forward validation for Logistic Regression."""
+    splits = walk_forward_splits(records)
+    if not splits:
         return {
             "status": "NOT_ENOUGH_DATA", "samples": 0, "accuracy": None,
-            "brier_score": None, "log_loss": None,
-            "training_samples_before_validation": max(0, split_index),
+            "precision": None, "recall": None, "specificity": None,
+            "balanced_accuracy": None, "f1": None, "brier_score": None,
+            "log_loss": None, "folds_completed": 0, "folds_skipped": 0,
         }
 
-    validation_rows = records[split_index:]
-    validation_start = validation_rows[0]["signal_ts"]
+    all_predictions = []
+    all_baseline_predictions = []
+    fold_reports = []
+    folds_skipped = 0
 
-    # Strict holdout: every training label must have been known before
-    # the first validation signal appeared.
-    training_rows = [
-        row for row in records[:split_index]
-        if row["signal_ts"] < validation_start and row["label_ts"] < validation_start
-    ]
-    training = [(row["features"], row["target"]) for row in training_rows]
+    for split in splits:
+        training = [(row["features"], row["target"]) for row in split["training_rows"]]
+        validation = [(row["features"], row["target"]) for row in split["validation_rows"]]
+        weights, info = _fit_logistic(training, MIN_TRAINING_SAMPLES, MIN_CLASS_SAMPLES)
+        if weights is None:
+            folds_skipped += 1
+            fold_reports.append({"fold": split["fold"], "status": info["status"], "samples": 0})
+            continue
 
-    weights, info = _fit_logistic(
-        training,
-        VALIDATION_MIN_TRAINING_SAMPLES,
-        VALIDATION_MIN_CLASS_SAMPLES,
-    )
-    if weights is None:
-        return {
-            "status": info["status"], "samples": 0, "accuracy": None,
-            "brier_score": None, "log_loss": None,
-            "training_samples_before_validation": len(training),
-            "validation_candidates": len(validation_rows),
-        }
+        fold_predictions = [
+            (predict_probability(weights, features), target)
+            for features, target in validation
+        ]
+        baseline = baseline_metrics(training, validation)
+        all_predictions.extend(fold_predictions)
+        all_baseline_predictions.extend([
+            (sum(target for _, target in training) / len(training), target)
+            for _, target in validation
+        ])
+        fold_metrics = classification_metrics(fold_predictions)
+        fold_reports.append({
+            "fold": split["fold"],
+            "status": "READY",
+            "training_samples": len(training),
+            "validation_start": datetime.fromtimestamp(
+                split["validation_start"], timezone.utc
+            ).isoformat(),
+            "model": fold_metrics,
+            "baseline": baseline,
+        })
 
-    validation = [(row["features"], row["target"]) for row in validation_rows]
-    metrics = _validation_metrics(weights, validation)
+    metrics = classification_metrics(all_predictions)
+    baseline_all = classification_metrics(all_baseline_predictions)
     metrics.update({
-        "status": "READY",
-        "training_samples_before_validation": len(training),
-        "validation_candidates": len(validation_rows),
-        "validation_start": datetime.fromtimestamp(validation_start, timezone.utc).isoformat(),
+        "status": "READY" if metrics["samples"] >= MIN_VALIDATION_SAMPLES else "NOT_ENOUGH_VALIDATION_DATA",
+        "baseline": baseline_all,
+        "folds_completed": len([item for item in fold_reports if item["status"] == "READY"]),
+        "folds_skipped": folds_skipped,
+        "fold_reports": fold_reports,
+        "evaluation": "WALK_FORWARD_EXPANDING_WINDOW",
     })
+    if metrics["samples"] and baseline_all.get("accuracy") is not None:
+        metrics["accuracy_delta_vs_baseline"] = round(
+            metrics["accuracy"] - baseline_all["accuracy"], 2
+        )
+        if metrics["brier_score"] is not None and baseline_all.get("brier_score") is not None:
+            metrics["brier_delta_vs_baseline"] = round(
+                metrics["brier_score"] - baseline_all["brier_score"], 5
+            )
     return metrics
+
+
+def _validation_metrics(weights, dataset):
+    predictions = [
+        (predict_probability(weights, features), target)
+        for features, target in dataset
+    ]
+    return classification_metrics(predictions)
 
 
 def _temporal_validation(dataset):
@@ -344,8 +466,9 @@ def _temporal_validation(dataset):
     if split_index < VALIDATION_MIN_TRAINING_SAMPLES:
         return {
             "status": "NOT_ENOUGH_DATA", "samples": 0, "accuracy": None,
-            "brier_score": None, "log_loss": None,
-            "training_samples_before_validation": max(0, split_index),
+            "precision": None, "recall": None, "specificity": None,
+            "balanced_accuracy": None, "f1": None, "brier_score": None,
+            "log_loss": None, "training_samples_before_validation": max(0, split_index),
         }
     training = dataset[:split_index]
     validation = dataset[split_index:]
@@ -353,16 +476,22 @@ def _temporal_validation(dataset):
     if weights is None:
         return {
             "status": info["status"], "samples": 0, "accuracy": None,
-            "brier_score": None, "log_loss": None,
-            "training_samples_before_validation": len(training),
+            "precision": None, "recall": None, "specificity": None,
+            "balanced_accuracy": None, "f1": None, "brier_score": None,
+            "log_loss": None, "training_samples_before_validation": len(training),
         }
     metrics = _validation_metrics(weights, validation)
-    metrics.update({"status": "READY", "training_samples_before_validation": len(training)})
+    metrics.update({
+        "status": "READY",
+        "training_samples_before_validation": len(training),
+        "baseline": baseline_metrics(training, validation),
+        "evaluation": "LEGACY_SINGLE_HOLDOUT",
+    })
     return metrics
 
 
 def train_model(dataset):
-    """Train on all supplied eligible examples; validate with strict time holdout when metadata exists."""
+    """Train on all supplied eligible examples; validate chronologically."""
     if dataset and isinstance(dataset[0], dict) and "signal_ts" in dataset[0]:
         validation = _temporal_validation_records(dataset)
         usable = [(row["features"], row["target"]) for row in dataset]
@@ -388,7 +517,8 @@ def evaluate_signal(signal, history_file=None):
         prediction_ts = _parse_timestamp(signal.get("timestamp")) or time.time()
 
         for horizon in HORIZONS:
-            eligible = _eligible_records(records_by_horizon[horizon], prediction_ts)
+            records = records_by_horizon[horizon]
+            eligible = _eligible_records(records, prediction_ts)
             dataset = [(row["features"], row["target"]) for row in eligible]
             weights, info = _fit_logistic(dataset, MIN_TRAINING_SAMPLES, MIN_CLASS_SAMPLES)
             prediction = {
@@ -397,7 +527,7 @@ def evaluate_signal(signal, history_file=None):
                 "wins": info["wins"],
                 "losses": info["losses"],
                 "win_probability": None,
-                "validation": _temporal_validation_records(records_by_horizon[horizon]),
+                "validation": _temporal_validation_records(records),
             }
             if weights is not None:
                 prediction["win_probability"] = round(predict_probability(weights, features) * 100.0, 2)
