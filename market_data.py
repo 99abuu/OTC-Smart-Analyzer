@@ -74,6 +74,123 @@ def validate_candle(candle):
     return True
 
 
+def validate_candle_timestamps(candles, timeframe, symbol):
+    """
+    Verify that candle timestamps exist, are valid,
+    strictly ascending, and separated by the requested
+    timeframe.
+    """
+
+    timestamps = []
+
+    for index, candle in enumerate(candles):
+        if not isinstance(candle, dict):
+            raise RuntimeError(
+                f"Invalid candle structure for {symbol} at index {index}"
+            )
+
+        timestamp = parse_price(candle.get("time"))
+
+        if timestamp is None:
+            raise RuntimeError(
+                f"Missing or invalid candle timestamp | "
+                f"symbol={symbol} | index={index}"
+            )
+
+        timestamps.append(timestamp)
+
+    for index in range(1, len(timestamps)):
+        previous_time = timestamps[index - 1]
+        current_time = timestamps[index]
+
+        difference = current_time - previous_time
+
+        if difference <= 0:
+            raise RuntimeError(
+                f"Candle timestamps are not ascending | "
+                f"symbol={symbol} | index={index} | "
+                f"previous={previous_time} | current={current_time}"
+            )
+
+        if not math.isclose(
+            difference,
+            timeframe,
+            rel_tol=0,
+            abs_tol=0.001
+        ):
+            raise RuntimeError(
+                f"Candle timestamp gap detected | "
+                f"symbol={symbol} | index={index} | "
+                f"expected={timeframe}s | actual={difference}s"
+            )
+
+    logger.info(
+        "CANDLE TIMESTAMPS VALID | symbol=%s | "
+        "count=%s | timeframe=%s",
+        symbol,
+        len(timestamps),
+        timeframe
+    )
+
+
+def validate_candle_gaps(data, symbol):
+    """
+    Reject candle responses containing missing bars
+    or invalid/missing gap diagnostics.
+    """
+
+    gaps = data.get("gaps")
+
+    if not isinstance(gaps, dict):
+        raise RuntimeError(
+            f"Missing or invalid gaps information for {symbol}"
+        )
+
+    runs = gaps.get("runs")
+    missing_bars = gaps.get("missingBars")
+
+    if (
+        isinstance(runs, bool)
+        or not isinstance(runs, int)
+        or runs < 0
+    ):
+        raise RuntimeError(
+            f"Invalid gaps.runs value for {symbol}: {runs!r}"
+        )
+
+    if (
+        isinstance(missing_bars, bool)
+        or not isinstance(missing_bars, int)
+        or missing_bars < 0
+    ):
+        raise RuntimeError(
+            f"Invalid gaps.missingBars value for {symbol}: "
+            f"{missing_bars!r}"
+        )
+
+    logger.info(
+        "CANDLE GAP DIAGNOSTIC | symbol=%s | "
+        "runs=%s | missing_bars=%s",
+        symbol,
+        runs,
+        missing_bars
+    )
+
+    if runs != 0 or missing_bars != 0:
+        logger.error(
+            "CANDLE DATA REJECTED DUE TO GAPS | "
+            "symbol=%s | runs=%s | missing_bars=%s",
+            symbol,
+            runs,
+            missing_bars
+        )
+
+        raise RuntimeError(
+            f"OTCharts returned incomplete candle history "
+            f"for {symbol}: runs={runs}, missingBars={missing_bars}"
+        )
+
+
 def make_request(url):
     request = urllib.request.Request(
         url,
@@ -183,12 +300,24 @@ def fetch_candles(
             "No candles returned by OTCharts"
         )
 
-    # Temporary diagnostics:
     # Inspect the raw candle structure and timestamp fields.
     log_candle_diagnostics(
         symbol,
         candles,
         timeframe
+    )
+
+    # Reject responses that report missing candles.
+    validate_candle_gaps(
+        data,
+        symbol
+    )
+
+    # Verify chronological order and exact timeframe spacing.
+    validate_candle_timestamps(
+        candles,
+        timeframe,
+        symbol
     )
 
     invalid_count = 0
@@ -209,6 +338,14 @@ def fetch_candles(
             f"OTCharts returned {invalid_count} invalid candles "
             f"for {symbol}"
         )
+
+    logger.info(
+        "CANDLE DATA ACCEPTED | symbol=%s | "
+        "count=%s | timeframe=%s",
+        symbol,
+        len(candles),
+        timeframe
+    )
 
     return candles
 
