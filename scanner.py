@@ -1885,8 +1885,15 @@ async def scanner_loop(
 
             if primary:
                 try:
-                    delivery_response = await send_result(primary)
-delivered = delivery_response is not False
+    delivery_response = await send_result(primary)
+    delivered = delivery_response is not False
+
+except Exception:
+    logger.exception(
+        "Selected-duration result delivery failed: %s",
+        symbol
+    )
+    delivered = False
 
                 except Exception:
                     logger.exception(
